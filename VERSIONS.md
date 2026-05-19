@@ -8,11 +8,16 @@ diff of what changed.
 
 - **Hardware register usage**: Identical (both versions use the same 78 audio
   registers)
-- **RACE protocol structure**: Identical
+- **RACE protocol structure**: Identical (same dispatch table, same command IDs)
 - **Audio mixer code**: Identical (functions in same place)
-- **Factory default gain values**: **Changed for BT/dongle** (this is the
-  visible behavior change)
-- **Function offsets**: Most code shifted by ~16 bytes (compiler artifacts)
+- **Factory default gain values**: **Changed for BT/dongle** — the visible
+  behavior change that broke balance for some users
+- **Function offsets**: A handful of functions moved by 0x10–0x280 bytes
+- **Total differing bytes**: **~1.3 million** (~42% of the 3.2 MB
+  decompressed image) — Audeze made substantial changes beyond just the
+  balance defaults. Most diffs are in partition 2 (the main code, file
+  offsets `0x114000`+). What those changes actually do remains
+  unresearched — community RE welcome.
 
 ## File-level comparison
 

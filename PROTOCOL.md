@@ -97,10 +97,69 @@ Located at file offset `0x26B850` in v1.0.1.63 and **`0x26B8E0`** in v1.0.1.74
 The two ranges in **bold** are the most-commonly-used: `0x0900` for gain/balance/NVDM
 and `0x2C00` for chatmix/sidetone.
 
-## Sub-commands of 0x0900 (audio register R/W)
+## Cmd 0x0900 range internals
 
-When `cmd = 0x0900`, the byte at `payload[2]` is a **sub-command** that selects
-the specific operation. Handled by `FUN_0015C91C`:
+The dispatch table entry `0x0900-0x09FF` (handler at runtime `0x0817B92C`)
+internally dispatches on the **full 16-bit cmd_id**:
+
+| Cmd | Handler addr | What it does |
+|-----|-------------|--------------|
+| `0x0900` | `0x0817B0E4` | (undocumented) |
+| `0x0901` | `0x0817B410` | **Big sub-command dispatcher — see below** |
+| `0x0910` | `0x0817B374` | Status query — returns 10-byte struct (battery, status, etc.) |
+| `0x09FD` | `0x0817B8A0` | (undocumented) |
+
+## Sub-commands of 0x0901 (audio register R/W)
+
+The `0x0901` handler at `0x0817B410` switches on a sub-command byte
+(read from `[r0+6]`) via TBH jump table at `0x0817B436`. **50 sub-commands
+are recognized (`0x00`–`0x31`)**, of which only ~10 were previously
+documented. Sub-commands that route to `0x0817B89A` are unhandled
+(return 0).
+
+| Sub | Target addr | Known purpose / notes |
+|-----|-------------|----------------------|
+| `0x00` | `0x0817B49A` | (undocumented, 4-byte response) |
+| `0x01` | `0x0817B89A` | unhandled |
+| `0x02` | `0x0817B506` | (undocumented, calls `0x0817B008`) |
+| `0x03` | `0x0817B570` | (undocumented, 4-byte response) |
+| `0x04` | `0x0817B89A` | unhandled |
+| `0x05` | `0x0817B4E2` | (undocumented, **6-byte** response) |
+| `0x06` | `0x0817B5C4` | (undocumented, 4-byte response) |
+| `0x07` | `0x0817B5A0` | (undocumented, **5-byte** response) |
+| `0x08`-`0x09` | `0x0817B89A` | unhandled |
+| `0x0A` | `0x0817B624` | (undocumented, 4-byte response) |
+| `0x0B` | `0x0817B4C2` | (undocumented, 4-byte response) |
+| `0x0C`-`0x1F` | `0x0817B89A` | unhandled (most of low range) |
+| `0x20` | `0x0817B66A` | Write 1-byte value to `NVDM 0xF666` (source preference flag) |
+| `0x21` | `0x0817B89A` | unhandled |
+| `0x22` | `0x0817B68C` | (undocumented, 4-byte response) |
+| `0x23` | `0x0817B6E4` | (undocumented, 4-byte response) |
+| `0x24` | `0x0817B714` | Audio reset (calls `FUN_001AAB74`+`FUN_001AABF8`) |
+| `0x25` | `0x0817B734` | **Balance slider** (-6 to +6 from 0x80) — `FUN_001BEFB4` |
+| `0x26` | `0x0817B7FA` | (undocumented, 4-byte response) |
+| `0x27` | `0x0817B81A` | Volume (returns 1) — `FUN_001AA5C0` |
+| **`0x28`** | `0x0817B754` | **MASTER gain → SRAM byte 0+1** — `FUN_001BF04C(val, 3)` |
+| **`0x29`** | `0x0817B754` | **LEFT gain → SRAM byte 0** — `FUN_001BF04C(val, 1)` |
+| **`0x2A`** | `0x0817B754` | **RIGHT gain → SRAM byte 1** — `FUN_001BF04C(val, 2)` |
+| `0x2B` | `0x0817B79A` | (undocumented, 4-byte response) |
+| `0x2C` | `0x0817B7BA` | Audio config write — `FUN_001ADB48` |
+| `0x2D` | `0x0817B7DA` | (undocumented, 4-byte response) |
+| `0x2E` | `0x0817B83A` | Audio config write — `FUN_001BF768` |
+| **`0x2F`** | `0x0817B85A` | **Set audio source state in `NVDM 0xF702`** (state=10 = USB-C) |
+| `0x30` | `0x0817B87A` | (undocumented, 4-byte response) |
+| **`0x31`** | `0x0817B754` | **(undocumented) — uses gain handler but takes a different code path (calls `0x081DE058` instead of `0x081DE080`). Likely a READ counterpart or alternate channel selector.** |
+
+The gain sub-commands (`0x28`/`0x29`/`0x2A`) all share the same handler at
+`0x0817B754`, which routes by sub-cmd value to `FUN_001BF04C(val, channel)`
+with `channel` = 3 (master), 1 (left), or 2 (right). Sub `0x31` enters the
+same handler but jumps to `FUN_001DE058` instead — likely a getter or an
+alternate channel write.
+
+**40+ sub-commands are undocumented but reachable.** Each handler follows
+the same skeleton (allocate response buffer, call a specific function,
+return). Tracing each would expand RACE coverage significantly. Format:
+all responses are 4 bytes except sub `0x05` (6 bytes) and `0x07` (5 bytes).
 
 | Sub | Action | Notes |
 |-----|--------|-------|

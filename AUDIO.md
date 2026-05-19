@@ -235,6 +235,61 @@ all active streams) before setting up the new mode. This is a software-only
 restriction — the hardware mixer can route up to 3 different streams
 simultaneously to different channels.
 
-NOPing the `BL FUN_00137F48` instruction in `FUN_00135BA8` would let multiple
-streams coexist. But firmware modification is blocked (see
-[FLASHING.md](FLASHING.md)).
+**Status (Dec 2025)**: NOPing the `BL FUN_00137F48` instruction at file
+offset `0x135C66` (runtime `0x08154C66`) is one of the patches applied in
+the working custom-firmware build documented in [FLASHING.md](FLASHING.md).
+The patch was successfully flashed and verified live in flash. **However**,
+empirical testing showed this fixes only some source-pair combos, not all:
+
+- ✅ USB-C ↔ BT path (which our patched BL gates) works
+- ❌ BT ↔ dongle path still kills the previous source
+
+The function `FUN_00137F48` has only one external entry point (and one
+recursive self-call inside the function itself); we scanned for all BL/BLX
+to that address with a custom decoder and confirmed only those two sites
+exist. So **the BT+dongle case uses a DIFFERENT reset function** that we
+haven't yet identified. Suggested next investigation: trace through
+`FUN_0015C91C` (the RACE 0x900 sub-command handler) starting from sub 0x2F
+(source state change), and look at what gets called when state transitions
+between BT and dongle modes specifically.
+
+## Audio codecs supported
+
+Strings in the firmware confirm support for:
+
+- **SBC** — standard BT audio codec (low quality, universal)
+- **AAC** — Apple/Bluetooth high-quality codec
+  (strings: `AAC_ON`/`AAC_OFF`)
+- **mSBC** — modified SBC for HFP wideband speech (mic)
+- **CVSD** — legacy HFP narrowband speech codec
+- **LC3** — Bluetooth LE Audio codec (`LC3I_Enc_Prcs`, `LC3I_Dec_Prcs`)
+
+NOT present in firmware: **aptX**, **aptX HD**, **LDAC**. Those would require
+licensed codec implementations which Audeze evidently doesn't ship.
+
+The LC3 strings imply LE Audio support is at least partially compiled in,
+even though Maxwell isn't marketed as an LE Audio headset. This is a
+potential research target — if LE Audio works (or could be enabled via
+configuration), it would offer better latency and lower bitrate options.
+
+## Parametric EQ (PEQ) — the preset system
+
+Strings reveal two PEQ instances:
+
+- `PEQ_SVN_version:0x%x ` — main PEQ version tag
+- `PEQ2_INIT:0x%x ` / `PEQ2_PROC:0x%x ` — secondary PEQ (used for second
+  filter bank, possibly mic processing or per-channel)
+- `PEQ phase:%d enable:%d realtime` — runtime PEQ enable
+- `PEQ phase:%d enable:%d nvkey:0x%x` — **PEQ is configured via NVDM keys**
+
+The factory-init NVDM defaults at file offset `0x24B970`+ write:
+
+- **`NVDM 0xE304`** (194 bytes) — first PEQ coefficient block
+- **`NVDM 0xE301`** (16 bytes + 564 bytes via two writes) — second
+  coefficient block (the 564 bytes likely covers all 10 EQ presets' filter
+  coefficients — ~56 bytes per preset)
+
+Patching these NVDM defaults in firmware would change the baseline EQ
+behavior. Decoding the exact coefficient format (likely biquad: 5 floats
+per section × N sections × M bands) is a research target for anyone wanting
+to customize Maxwell's sound signature.

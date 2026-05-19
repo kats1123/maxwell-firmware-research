@@ -4,45 +4,79 @@
 
 - Firmware files are LZMA-Alone compressed (NO encryption)
 - Decompresses to a 3.2 MB ARM Cortex-M4 image
-- Header at offset 0–0x21A contains version info, partition table, and a SHA-256 hash of the rest of the file
-- Decompressing it is trivial; modifying and re-flashing is **blocked by bootloader signature verification** (see [FLASHING.md](FLASHING.md))
+- Header at offset 0–0x21A contains version info, partition table, per-partition SHA hashes, LZMA stream-size field, and a top-level SHA-256 hash of the rest of the file
+- All integrity is **SHA-256 only** — no asymmetric signatures — so the firmware is **modifiable and reflashable** if you correctly recompute the right hash fields (see [FLASHING.md](FLASHING.md))
 
-## File layout
+## File layout (complete)
 
 A raw `Maxwell_v1.0.1.NN_XBOX_headset.bin` file is structured as:
 
 ```
-0x0000-0x001F : 32-byte SHA-256 hash of bytes[0x100:]
+0x0000-0x001F : 32-byte top-level SHA-256 hash of bytes[0x100:]   ← recomputable
 0x0020-0x00FF : 0xFF padding
-0x0100-0x011B : version metadata (TLV format, contains "v1.0.1.NN" string)
-0x012C-0x0166 : partition table TLV (tag 0x0012, 4 entries of 12 bytes each)
-0x01F0-0x021A : chip identifiers ("AB1568_Headset", "headset_ref_design")
+0x0100-0x010D : TLV 0x0011 = basic info (10 bytes value)
+                bytes 0-1: 01 01            (flags)
+                bytes 2-5: 00 10 00 00      (LE 0x1000, LZMA stream start)
+                bytes 6-9: ac 40 1f 00      (LE LZMA STREAM SIZE — must be exact)
+0x010E-0x0129 : TLV 0x0013 = version string ("vN.N.N.NN\0" + 0xFF padding)
+0x012E-0x0165 : TLV 0x0012 = partition table (52-byte value)
+0x0166-0x01ED : TLV 0x0014 = per-partition SHA-256 hashes (132 bytes)
+0x01EE-0x01FC : TLV 0x0020 = chip identifier ("AB1568_Headset")
+0x0200-0x0214 : TLV 0x0021 = design name ("headset_ref_design")
+0x0216-0x021A : TLV 0x00F0 = misc flag (1 byte: 0x01)
 0x021B-0x0FFF : 0xFF padding
-0x1000+       : LZMA-Alone stream
+0x1000+       : LZMA-Alone compressed stream
 ```
+
+The 3 fields that must be updated correctly when modifying firmware:
+
+1. **TLV `0x0014`** (per-partition hashes) — for each modified partition,
+   recompute SHA-256 over its decompressed bytes and overwrite the
+   corresponding 32-byte slot.
+2. **TLV `0x0011` LZMA stream size** (bytes 6-9 of value) — recompression
+   changes the compressed stream length; this field must match exactly or
+   the bootloader reads past actual data and decompression fails.
+3. **`file[0:32]`** — top-level SHA-256 of `file[0x100:]`. Recompute LAST,
+   after all other changes.
 
 ### Partition table
 
-At offset `0x130` (TLV with tag `0x0012`, length `0x34`):
+At offset `0x12E` (TLV `0x0012`, value length `0x34`):
 
 ```
 04 00 00 00                    count = 4 entries
 
 Entry 1: 00 10 00 00  00 40 11 00  00 30 01 00
-         addr=0x1000  size=0x114000  ??=0x13000
+         src=0x001000  size=0x114000  dst_flash=0x013000
 Entry 2: 00 50 11 00  00 b0 19 00  00 30 13 00
-         addr=0x115000 size=0x19b000 ??=0x133000
+         src=0x115000  size=0x19b000  dst_flash=0x133000
 Entry 3: 00 00 2b 00  00 40 01 00  00 c0 32 00
-         addr=0x2b0000 size=0x14000  ??=0x32c000
+         src=0x2b0000  size=0x014000  dst_flash=0x32c000
 Entry 4: 00 40 2c 00  00 b0 04 00  00 00 45 00
-         addr=0x2c4000 size=0x4b000  ??=0x450000
+         src=0x2c4000  size=0x04b000  dst_flash=0x450000
 ```
 
-Partition `addr` and `size` cover the decompressed firmware exactly:
-0x114000 + 0x19b000 + 0x14000 + 0x4b000 = **0x30E000 = 3,203,072 bytes** (= the full decompressed firmware).
+- `src` = offset into the (decompressed image + header) — i.e. position of
+  this partition's start within the source stream (with 0x1000 base offset
+  for the file header). For the first partition, `src=0x1000` = start of
+  LZMA stream in the file.
+- `size` = number of bytes in this partition's decompressed content
+- `dst_flash` = where this partition lives on the SPI flash chip after
+  unpacking (`0x08013000`, `0x08133000`, etc. at runtime — XIP base
+  `0x08000000` + this offset)
 
-The third field in each entry is unclear — possibly a per-partition CRC, offset
-in compressed stream, or a flash bank address. Not needed for decompression.
+Partition `size` sums to `0x30E000` = full decompressed firmware. The
+mapping `flash_addr = 0x0801F000 + decompressed_offset` (confirmed live
+via RACE reads) tells us:
+
+- Partition 1 decompressed runs from `0x08013000` to `0x08127000` at runtime
+- Partition 2 decompressed runs from `0x08133000` to `0x082CE000` (contains
+  reset vector at `0x08133000`)
+- Partitions 3 and 4 live at `0x0832C000` and `0x08450000` respectively
+
+The "gap" between partitions is intentional (boot region, NVDM region, FOTA
+inactive bank). See [BOOTLOADER.md](BOOTLOADER.md) for the full chip-level
+partition map.
 
 ## LZMA-Alone parameters
 
@@ -144,8 +178,41 @@ Some useful debug strings in the decompressed payload:
 | ~0x26DD9X | `gain_value_mapping` + `audio_nvdm` | NVDM key names for gain LUT |
 | ~0xED8FC | `clk_skew_compensate_by_sw_algorithm` | Clock drift compensation |
 
+## NVDM key inventory
+
+The firmware writes "factory defaults" to NVDM via
+`nvdm_write_default(key, buf, len)` at runtime address `0x081AF824` (i.e.
+file offset `0x190824`). We scanned the firmware for all BL call sites to
+this function and recovered 17 distinct call sites covering 11 unique NVDM
+keys. After a factory reset, the patched code at these sites is what writes
+new defaults — so patching the immediate values lets us change shipped
+defaults persistently.
+
+| NVDM key | Length | Default | File offset of `movw r0,#key` | Purpose |
+|----------|--------|---------|-------------------------------|---------|
+| `0xF665` | 4 | `0x958D` (L=141 R=149) | `0x186CAC` | **USB-C audio source balance** (state=10) |
+| `0xF668` | 4 | `0x9393` (L=147 R=147) | `0x186C7A` | **BT/dongle audio source balance** (state≠10) |
+| `0xF66E` | 2 | `0x0901` | `0x186CDE` | **Unknown audio flag** — written by same factory init function. Two-byte value `09 01`. Possibly source-state mask, codec selector, or audio-routing flag. |
+| `0xE091` | 6 | ? | `0x18CA3E` (?) | Unknown 6-byte struct |
+| `0xE1E0` | 12 | first 2 bytes `0x7FFF` | `0x248A6C` | Likely **volume / gain limiter struct**. `0x7FFF` = INT16 max — classic max-cap value. 12 bytes suggests {max_left, max_right, current_left, current_right, ...} or biquad coefficients. |
+| `0xE1E1` | ? | ? | (related) | Companion to `0xE1E0` |
+| `0xE1E5` | 8 | ? | `0x247B32` | Unknown 8-byte struct |
+| `0xE301` | 16 / 564 | varies (two writes) | `0x24B9B6` / `0x24BA50` | Probably **EQ preset / DSP coefficients**. 564 bytes = 141 floats or 564 bytes ≈ enough for ~14 biquad sections (40 bytes each) |
+| `0xE304` | 194 | ? | `0x24B97C` | Companion to `0xE301`, another **DSP coefficient block** |
+| `0xE400` | 20 | (error code) | `0x18669C`, `0x186D40` | **Error log** — written when factory init operations fail |
+| `0x0012` | (varies) | ? | `0x1904E2` | Probably misidentified — overlaps with partition table TLV tag |
+
+> **Open questions**: NVDM `0xF66E`, `0xE1E0`, `0xE301`, and `0xE304` are
+> particularly interesting because they live in the same factory-init code
+> path as the L/R balance values. Decoding what these control is a high-ROI
+> RE target. If `0xE1E0` is the volume cap (very likely given the `0x7FFF`
+> default), patching it could enable louder-than-stock output for users who
+> want it. If `0xE301`/`0xE304` are EQ coefficients, patching them could
+> change the headset's baseline sound signature.
+
 ## Tools used
 
 - **Ghidra** 12.0.4 — disassembly and decompilation, ARM Cortex-M little-endian
 - **Python lzma** module — decompression
+- **Capstone** disassembler — for scriptable scanning (BL target hunting, etc.)
 - **airoha-firmware-parser** — drop-in decompression script

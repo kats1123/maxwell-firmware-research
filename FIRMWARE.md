@@ -302,6 +302,74 @@ etc.), the runtime balance buffer is NOT reloaded from NVDM. Confirms
 empirical observation that physical source switch doesn't change the
 runtime balance.
 
+### Boot chain — full sequence
+
+**Discovered December 2025 via reset-handler tail-call analysis.** The reset
+handler's tail-call uses `BX r0` (not `BL`) so it was invisible to BL/B.W
+scans. The address `0x081D9355` (Thumb) lives in the reset-handler literal
+pool at runtime `0x08133154` and is loaded into `r0` immediately before the
+final `BX r0` at `0x081330B8`.
+
+```
+Reset vector (chip ROM)
+  → bootloader at 0x08003000 (validates, decompresses LZMA, loads partitions)
+  → partition 2 reset handler at 0x08133000
+    - CPSID i (disable interrupts)
+    - Setup MSP, NVIC table base
+    - Zero-init a peripheral region (~0x04025xxx)
+    - 6× memcpy from flash to SRAM/peripheral RAM (.data init — see SRAM map)
+    - BLX 0x081DF03C (hardware register clock/power init)
+    - BX  0x081D9355 ← TAIL CALL TO MAIN()
+                       ┴── never returns
+```
+
+### Main entry: `FUN_0x081D9354`
+
+This is the firmware's actual `main()`. It's never `BL`-called from
+anywhere — it's only reached via the reset-handler's final `BX r0`.
+Function ends in an infinite branch-to-self at `0x081D941A` (post-
+scheduler-start unreachable code).
+
+Execution sequence at boot:
+
+| Order | Code | Purpose |
+|-------|------|---------|
+| 1 | `BL 0x081DB048` | (TBD — unidentified subsystem init) |
+| 2 | `BL 0x081C2FB8` | (TBD — unidentified subsystem init) |
+| 3 | Read **NVDM `0xF666`** (1 byte) | sub-config — low 4 bits passed to `BL 0x081AFE04` (stores to a 1-byte SRAM flag) |
+| 4 | Read **NVDM `0xF667`** (1 byte) | sub-config — full byte passed to `BL 0x081C9B84` |
+| 5 | `BL 0x081D40B0` | Check (returns 0/non-0 — affects branching) |
+| 6 | `BL 0x081DDD74` | FreeRTOS task / queue creation wrapper |
+| 7 | **`BL 0x081DE120`** | **AUDIO ROUTING INIT — writes DSP registers directly with HARDCODED constants** (not NVDM) |
+| 8 | Read **NVDM `0xF66C`** (3 bytes) | sub-config — second byte passed to `BL 0x081DEE88` |
+| 9 | `BL 0x08138988(0, 2)` | Likely `vTaskStartScheduler()` — never returns |
+| 10 | (unreachable) | `B 0x081D941A` infinite loop |
+
+### The boot DSP-init function `FUN_0x081DE120`
+
+Decoded December 2025. This function writes many DSP registers via
+`FUN_0x081DDF54(reg_outer_id, value, reg_inner_id)`. The register-IDs
+it writes include `0x38`/`0x39` (LEFT/RIGHT — the SAME IDs used by the
+DSP-apply function `FUN_0x081DDF78`), with outer-IDs `0x23FF`, `0x203A`,
+`0x23E1`, `0x23E0`, `0x23BA`, `0x2084`, `0x226`, `0x225`.
+
+Crucially: the values written are HARDCODED in the function (`0`, `0x80`,
+`0x81`, `1`, `0x20`), NOT loaded from NVDM `0xF665` or `0xF668`. After
+boot, the DSP runs with these hardcoded gains — until a RACE balance
+write triggers `FUN_0x081DE094` → `FUN_0x081DDF78`, which then pushes
+`0x142039AC`'s value (initially `0x88 0x88`) to the DSP.
+
+**This is the architectural explanation** for why:
+- At boot, the runtime buffer (`0x142039AC` = `0x88 0x88`) and the actual
+  DSP gain values are NOT in sync.
+- Physical source switching has no effect on either the buffer or the
+  DSP gain (no code path reloads either from NVDM).
+- The NVDM `0xF665`/`0xF668` defaults patched by the custom firmware
+  are NEVER read into runtime at boot — they only affect what's
+  persisted to NVDM the next time a RACE write happens (and only
+  if Loader A's NVDM-write path is triggered, which it is via
+  `0x0817B250`).
+
 ### Boot-time SRAM map (full)
 
 The reset handler at runtime `0x08133000` calls a memcpy helper at

@@ -46,10 +46,29 @@ PROFILE = {
     # State 1 and 0xF1 both call bigger_router_reset (FUN_00137F9C). The BL is at this offset.
     "concurrent_offset_2":  0x135CC4,
     "concurrent_original_2": bytes([0x02, 0xF0, 0x6A, 0xF9]),  # bl FUN_00137F9C (bigger_router_reset)
+    # .data section bytes for 0x142039AC (runtime balance buffer initial value).
+    # Reset handler memcpys from flash 0x082A6F48 (file offset 0x287F48) to SRAM
+    # 0x142039AC at every true cold boot. Patching these bytes gives boot-time
+    # firmware-only L/R balance — no host intervention needed. (May 2026)
+    "data_offset":          0x287F48,
+    "data_original":        bytes([0x88, 0x88, 0x00, 0x00]),  # L=136, R=136, slider=0, dir=0
 }
 
 
-def build_patches(usb_l, usb_r, bt_l, bt_r, include_concurrent=True):
+def build_data_patch(usb_l, usb_r):
+    """Patch for the .data section initial bytes of 0x142039AC."""
+    return {
+        "name": "Runtime balance .data init (0x142039AC initial value)",
+        "file_offset": PROFILE["data_offset"],
+        "original_bytes": PROFILE["data_original"],
+        "patched_bytes":  bytes([usb_l & 0xFF, usb_r & 0xFF, 0x00, 0x00]),
+        "explanation": "Boot-time SRAM init for 0x142039AC: L=%d, R=%d (was: L=136, R=136). "
+                       "Combined with SRAM retention, this gives firmware-only balance that survives "
+                       "all normal use until next true cold reset." % (usb_l, usb_r),
+    }
+
+
+def build_patches(usb_l, usb_r, bt_l, bt_r, include_concurrent=True, include_data_patch=True):
     patches = []
     patches.append({
         "name": "BT/dongle balance (NVDM 0xf668 default)",
@@ -65,6 +84,8 @@ def build_patches(usb_l, usb_r, bt_l, bt_r, include_concurrent=True):
         "patched_bytes":  encode_movw(3, (usb_r << 8) | usb_l),
         "explanation": "USB-C default: L=%d, R=%d (was: L=141, R=149)" % (usb_l, usb_r),
     })
+    if include_data_patch:
+        patches.append(build_data_patch(usb_l, usb_r))
     if include_concurrent:
         patches.append({
             "name": "Concurrent playback site 1 (USB-C+BT)",
@@ -210,6 +231,8 @@ def main():
     ap.add_argument("--bt-l",  type=int, default=141)
     ap.add_argument("--bt-r",  type=int, default=154, help="BT/dongle right channel (default 154, factory 147)")
     ap.add_argument("--no-concurrent", action="store_true")
+    ap.add_argument("--no-data-patch", action="store_true",
+                    help="Skip the .data init patch (only patches NVDM defaults — for users who want HQ to control runtime values)")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verify-only", action="store_true",
                     help="Skip patching, just verify input firmware integrity")
@@ -244,7 +267,9 @@ def main():
     print(f"  BT/dongle:   L={args.bt_l}, R={args.bt_r} (delta R-L = {args.bt_r-args.bt_l:+d})")
     print(f"  Concurrent playback: {'OFF' if args.no_concurrent else 'ON'}")
 
-    patches = build_patches(args.usb_l, args.usb_r, args.bt_l, args.bt_r, not args.no_concurrent)
+    patches = build_patches(args.usb_l, args.usb_r, args.bt_l, args.bt_r,
+                            include_concurrent=not args.no_concurrent,
+                            include_data_patch=not args.no_data_patch)
     data = bytearray(decompressed)
     for patch in patches:
         print(f"\nApplying: {patch['name']}")

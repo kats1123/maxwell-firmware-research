@@ -142,6 +142,38 @@ privilege escalation in the active firmware.
    important caveat below about whether NVDM values are actually applied
    to runtime audio.**
 
+## NEW (May 2026) — proposed `.data` patch for true firmware-only balance
+
+**The cleanest firmware-only fix** for L/R balance is to patch the `.data`
+section bytes at file `0x287F48` (which the reset handler memcpys into
+runtime buffer `0x142039AC` at boot):
+
+| Field | Current bytes | Patched bytes |
+|-------|---------------|---------------|
+| Stock (file `0x287F48`) | `88 88 00 00` (L=136, R=136, slider=0, dir=0) | `<L> <R> 00 00` (your preferred L/R) |
+
+Example for L=141, R=143: change file `0x287F48` from `88 88 00 00` to
+`8D 8F 00 00`.
+
+This patch:
+- Affects boot init directly — the reset handler's `.data` memcpy copies
+  these bytes from flash to SRAM. No code execution needed.
+- Combined with **SRAM retention** (see [FIRMWARE.md](FIRMWARE.md) §SRAM
+  retention), the value persists across every "power off" until the next
+  true cold reset.
+- Survives factory reset (Audeze HQ's factory reset still works as
+  before via NVDM defaults + host-side RACE writes; AND now the firmware's
+  boot init also produces the same values, so the buffer is correct
+  regardless of host involvement).
+- Requires re-computing the partition-2 SHA-256 and outer SHA-256 (the
+  patch is inside partition 2's decompressed region — file `0x287F48` is
+  past the partition 2 start at `0x114000`).
+
+The existing patches at `0x186C72` and `0x186CA4` (NVDM defaults) are
+still useful — they ensure Audeze HQ's "load defaults" UI shows the right
+values — but they are now understood to be **secondary** to the `.data`
+patch, not primary.
+
 ## CRITICAL CAVEAT — NVDM balance patches may not actually change audio
 
 (December 2025 finding via static analysis — see [FIRMWARE.md](FIRMWARE.md)

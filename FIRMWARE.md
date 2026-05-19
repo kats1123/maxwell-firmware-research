@@ -392,6 +392,47 @@ The 0x14000000-region SRAM gets ~17.5 KB of .data plus presumably .bss
 zero-init elsewhere. The 0x04000000-region is much larger — 155 KB —
 suggesting that's where the DSP firmware/configuration lives.
 
+### SRAM retention across "power off" (May 2026 empirical test)
+
+The Audeze Maxwell's main SoC SRAM is **battery-backed** — the headset's
+internal battery keeps the SoC powered even when the user "powers off" by
+holding the power button. What the user perceives as a "power cycle" is
+actually a deep-sleep state, not a chip reset.
+
+**Test**: write a unique marker value (e.g. L=119 R=102) to `0x142039AC` via
+RACE, then unplug USB-C, hold power button 5+ seconds, wait 30 seconds, plug
+back in. Read the buffer: **marker is still there, unchanged**. SRAM was
+preserved across the entire "power off" sequence.
+
+**Implication**: the `.data` section memcpy in the reset handler (which
+would load `0x88 0x88` into `0x142039AC` from flash) only runs on a TRUE
+COLD RESET — which the user almost never triggers in normal use. Possible
+triggers for a true reset:
+- Battery fully drained (could take days)
+- Firmware reflash (FOTA)
+- Audeze HQ's "factory reset" action (triggers the firmware factory-reset
+  handler and likely a chip reboot)
+
+### Who actually writes the runtime buffer (definitive — empirically verified)
+
+| Trigger | Writes `0x142039AC`? |
+|---------|----------------------|
+| Cold boot (.data init) | **Yes** — loads `0x88 0x88 0x00 0x00` from flash `0x082A6F48` |
+| Normal "power off / on" (user-perceived power cycle) | **No** — SRAM retained, buffer unchanged |
+| Physical source switch (USB ↔ dongle) | **No** — no firmware code path consumes this for buffer reload |
+| RACE source-state change (cmd 0x0900 sub 0x2F) | **No** — only writes NVDM `0xF702`, no runtime effect |
+| Firmware factory-reset handler (`FUN_0x081DA030`, triggered by NVDM `0xF082`=`'U'`) | **No** — only rewrites NVDM keys (calls `FUN_0x081A5C70` etc.), no runtime buffer write |
+| Audeze HQ `SetFactoryResetEx` action | **Yes (host-side)** — HQ triggers firmware factory reset AND sends additional RACE balance writes via `FUN_0x081DE094` to load the new NVDM defaults into the buffer |
+| Audeze HQ at startup (idle, no user action) | **No** — empirically verified by opening HQ with marker `33 44` in buffer; buffer unchanged |
+| RACE balance write (cmd 0x0900 sub 0x29/0x2A) | **Yes** — goes through `FUN_0x081DE094` (the only live write path) |
+
+**Conclusion**: the only mechanism that writes to bytes 0/1 of `0x142039AC`
+at runtime is a RACE balance write from a host. Loader B
+(`FUN_0x081DE2E4`) is genuinely dead code — never called from anywhere.
+The custom firmware's NVDM `0xF665`/`0xF668` defaults are functional only
+through Audeze HQ's "factory reset" path, not through any firmware-only
+mechanism.
+
 ### How `0x142039AC` is actually initialized at boot
 
 **Discovered via boot-trace** (December 2025 — see

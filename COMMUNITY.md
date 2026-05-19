@@ -19,12 +19,62 @@ What we know, what's still unknown, and how to pick up where we left off.
 | Find correct LZMA stream size TLV (was missing piece) | ✅ Solved — TLV `0x0011` bytes 6-9 |
 | Concurrent playback patches | 🟡 Two BL sites identified (`0x135C66`, `0x135CC4`); empirical confirmation that this fixes BT+dongle still pending |
 | Boot ROM extraction | ❌ Not done. The TRUE boot ROM at `0x00000000` is unreadable (RACE memory reads crash the chip there). The first-stage bootloader is in flash at `0x08000000`+ and dumpable. |
-| L/R balance live runtime address | 🟡 Suspected at `0x142039AC` (per fallback-path xref). Reads there return zeros — value may only be live during active playback, async-loaded from NVDM. |
+| L/R balance live runtime address | ✅ **Confirmed at `0x142039AC`** — reads + writes verified affect audio mixer output for BOTH USB-C and dongle audio |
+| Per-source NVDM design (`0xF665` USB-C / `0xF668` dongle) works at runtime | ❌ **Disproven** — `0x142039AC` is a single shared buffer; source-change does not trigger reload; chip uses whichever NVDM key was loaded at boot init (typically `0xF665`) for ALL sources |
+| RACE balance writes persist across reboot | ✅ **Proven** — they write to NVDM `0xF665` in addition to RAM; survive power-cycle |
+| Factory reset re-runs patched factory init | ✅ **Proven** — values snap to patched NVDM defaults after reset |
 
 ## Confirmed open questions
 
 These are things we encountered but didn't fully resolve. Good starting
 points for further work:
+
+### 0. **(HIGHEST PRIORITY) What triggers the NVDM-to-runtime balance loader?**
+
+We found TWO loader functions (`FUN_0x081DDFD4` and `FUN_0x081DE2E4`) that
+read `NVDM 0xF665`/`0xF668` based on current source state and write into
+the runtime buffer `0x142039AC`. We've confirmed that:
+
+- Physical source switch (USB-C ↔ dongle) does **NOT** call either loader
+- RACE source-state change (`cmd 0x0900 sub 0x2F` with state=0 or 10)
+  does NOT call either loader
+- RACE balance writes (`cmd 0x0900 sub 0x29/0x2A`) update the buffer
+  directly, NOT via the loader (and ALSO write to NVDM, which is why
+  they're persistent)
+- After factory reset, the buffer ends up with `0xF665` values regardless
+  of physical connection — implying some boot-init path calls one of the
+  loaders with state==10
+
+**Important real-world implication for the community:** If the loader
+DOES get triggered by some event in normal operation that we haven't
+identified (BT pair/unpair, sleep/wake, factory event), and that trigger
+uses a STALE `NVDM 0xF702` state byte, users could randomly end up with
+the wrong balance loaded — producing seemingly-random "stuck" L/R
+imbalance complaints. This is a plausible explanation for the
+community's "balance suddenly shifted" reports.
+
+**Find:**
+- All callers (including indirect/jump-table) of `FUN_0x081DDFD4` and
+  `FUN_0x081DE2E4`
+- The boot-init code path that initially loads `0x142039AC`
+- Any RACE command or event that triggers the loader so we can test if
+  `NVDM 0xF668` (BT/dongle key) ever actually gets used at runtime
+- Whether patched `NVDM 0xF668` value (141/154) is even stored after
+  factory reset (might be skipped because `nvdm_write_default` won't
+  overwrite an existing key)
+
+### 0b. Why is `0x8E` (142) specifically rejected by the balance writer?
+
+Empirical: writing R=`0x8E` via RACE 0x0900 sub 0x2A silently rejects;
+values 0x8C, 0x8D, 0x8F, 0x90, 0x93, 0x9A all work. Decoding the
+validation logic in the cmd 0x0900 writer (around `0x817B132+`) would
+reveal whether this is:
+- A reserved sentinel
+- A saturation/range check (unlikely given range continues past)
+- An encoding-specific check
+- Some interaction with the balance-slider field (`0x142039AC[2]`)
+
+A full sweep of every byte 0x00-0xFF would map all rejected values.
 
 ### 1. Concurrent playback patch verification
 

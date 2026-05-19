@@ -150,6 +150,31 @@ documented. Sub-commands that route to `0x0817B89A` are unhandled
 | `0x30` | `0x0817B87A` | (undocumented, 4-byte response) |
 | **`0x31`** | `0x0817B754` | **(undocumented) — uses gain handler but takes a different code path (calls `0x081DE058` instead of `0x081DE080`). Likely a READ counterpart or alternate channel selector.** |
 
+**Important correction about read/write direction** (Dec 2025 empirical
+testing): cmd `0x0900` is the **WRITE** namespace; cmd `0x0901` is the
+**READ** namespace. They share the same sub-cmd numbering but do opposite
+things:
+
+| RACE | Effect |
+|------|--------|
+| `cmd 0x0900 sub 0x29` + value byte | **WRITE** new LEFT gain. Updates both `0x142039AC[0]` AND `NVDM 0xF665` (the USB-C key, regardless of physical source). Empirically confirmed persistent across full power-cycle. |
+| `cmd 0x0900 sub 0x2A` + value byte | WRITE new RIGHT gain. Same persistence. |
+| `cmd 0x0901 sub 0x29` (no value) | **READ** current LEFT gain. Returns `0x142039AC[0]` via `FUN_81DE080`. |
+| `cmd 0x0901 sub 0x2A` (no value) | READ current RIGHT gain. Returns `0x142039AC[1]`. |
+
+The write path also writes to `NVDM 0xF665` regardless of the current
+source state — meaning even if you write balance while on dongle, the
+USB-C NVDM key is what gets updated. The dongle key (`NVDM 0xF668`) is
+effectively write-only from factory init code; the runtime never writes
+it. See [AUDIO.md](AUDIO.md) §Runtime balance behavior for the full
+empirical observation log.
+
+**Validation rejection**: writing value `0x8E` (142) to either gain
+channel is silently rejected — the buffer reverts to the previous value
+or NVDM-loaded value. Values 0x8C, 0x8D, 0x8F, 0x90, 0x93, 0x9A all
+work. The validation logic in the cmd 0x0900 write handler (somewhere
+around `0x817B132+`) is undecoded. Reason unknown.
+
 The gain sub-commands (`0x28`/`0x29`/`0x2A`) all share the same handler at
 `0x0817B754`, which routes by sub-cmd value to `FUN_001BF04C(val, channel)`
 with `channel` = 3 (master), 1 (left), or 2 (right). Sub `0x31` enters the

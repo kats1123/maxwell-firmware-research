@@ -360,3 +360,169 @@ Patching these NVDM defaults in firmware would change the baseline EQ
 behavior. Decoding the exact coefficient format (likely biquad: 5 floats
 per section × N sections × M bands) is a research target for anyone wanting
 to customize Maxwell's sound signature.
+
+---
+
+# Runtime balance behavior — empirical findings (December 2025 session)
+
+After successfully flashing custom firmware with patched balance defaults,
+extensive on-device testing revealed that **the per-source NVDM design
+described above is real in flash but effectively unused at runtime**. This
+section documents what we proved empirically vs. what's just code-level
+description.
+
+## The actual runtime balance buffer
+
+There is a **single 4-byte runtime buffer** at `0x142039AC` in SRAM. Its
+layout (decoded empirically from observed writes and reader functions):
+
+| Offset | Field | Source |
+|--------|-------|--------|
+| `+0` | LEFT gain byte | Read by `FUN_81DE080(r0=1)` (RACE 0x0901 sub 0x29) |
+| `+1` | RIGHT gain byte | Read by `FUN_81DE080(r0=2)` (RACE 0x0901 sub 0x2A) |
+| `+2` | Balance slider position (-6..+6, written by RACE 0x0900 sub 0x25) | code at `0x081DE008`+ |
+| `+3` | Balance slider direction | same |
+
+**This single buffer is used by both USB-C and BT/dongle audio paths.**
+There is no per-source runtime buffer. Verified by: setting `0x142039AC`
+to `93 8D` (L=147 R=141) via RACE while on USB-C, then switching to
+dongle audio — user heard "L much louder" via dongle, matching the values
+set for USB-C. Confirmed the buffer is shared.
+
+## How the buffer gets loaded
+
+Two distinct loader functions in firmware can populate `0x142039AC` from
+the appropriate NVDM key:
+
+| Function | NVDM read function used | Behavior |
+|----------|------------------------|----------|
+| `FUN_0x081DDFD4` | `0x814fed8` (async NVDM read) | Reads `0xF665` if state==10 else `0xF668`; async result lands in `0x142039AC` later |
+| `FUN_0x081DE2E4` | `0x814feac` (synchronous NVDM read) | Same key selection logic; synchronous |
+
+We searched for every `BL` callsite to both loader functions:
+- `FUN_0x081DDFD4`: only ONE BL caller (`0x817B250`), which is inside
+  the cmd 0x0900 handler (the RACE balance-write code path)
+- `FUN_0x081DE2E4`: TBD (untraced) — but its code references `0x142039AC`
+  via `ldr r4, [pc, #0xf4]` so it's confirmed a writer for this buffer
+
+Source-state-change events (whether physical USB plug or RACE `0x2F`
+sub-cmd) do **NOT** call either loader directly.
+
+## What we observed across source/state events
+
+Test sequence (post-factory-reset, custom firmware with patched `0xF665`
+and `0xF668`):
+
+| Event | Buffer `0x142039AC` after | RACE read of L/R |
+|-------|---------------------------|------------------|
+| **Baseline** (USB-C, just plugged) | `8D 9A 00 00` | L=141 R=154 |
+| Played USB-C audio | unchanged | L=141 R=154 |
+| User reported "L much quieter than R" via USB-C | (consistent with `R=154 > L=141`) | — |
+| RACE write L=141 R=143 (our `0xF665` patched values) | `8D 8F 00 00` | L=141 R=143 |
+| User reported "L louder, R quieter, but L still quieter" | — | — |
+| Iterative RACE writes to find balance: L=147 R=141 ("balanced on USB-C") | `93 8D 00 00` | L=147 R=141 |
+| **Pause audio playback** | unchanged | L=147 R=141 |
+| **Unplug + replug USB-C** | unchanged | L=147 R=141 |
+| **Plug in dongle (USB-C disconnected)** | unchanged (read via dongle's RACE forwarding) | L=147 R=141 |
+| **Play audio via dongle** | unchanged; user heard "L much louder" via dongle | L=147 R=141 |
+| **Send RACE sub 0x2F state=0** (BT/dongle) | unchanged | L=147 R=141 |
+| **Send RACE balance write to trigger loader** | unchanged | L=147 R=141 |
+| **Send RACE sub 0x2F state=10** (USB-C) | unchanged | L=147 R=141 |
+| **Send RACE balance write again** | unchanged | L=147 R=141 |
+| **Full headset power-cycle** (off → wait → on) | unchanged (RACE via dongle reports same) | L=147 R=141 |
+| **Factory reset** (NVDM 0xF082 = 'U') | `8D 8F 00 00` | L=141 R=143 |
+
+## What this proves and disproves
+
+### Proven
+
+- **`0x142039AC[0]`/`[1]` is the live runtime gain that the audio mixer
+  actually uses for output.** Changing those bytes audibly changes
+  perceived L/R balance — for both USB-C and dongle audio.
+- **The buffer is shared across all sources.** USB-C and dongle audio
+  both consume the same two bytes; there is no per-source runtime gain
+  buffer in SRAM.
+- **Source-change does NOT auto-reload from NVDM.** Neither physical
+  source change (USB-C unplug / dongle plug) nor RACE source-state
+  change (sub 0x2F) triggers either loader function. The buffer just
+  keeps whatever was last written to it.
+- **RACE balance writes (RACE 0x0900 sub 0x29/0x2A) are persistent.**
+  They survive full power-cycle. Strong evidence that the write path
+  updates BOTH `0x142039AC` AND `NVDM 0xF665` (the active-source key).
+  Confirmed via: tuned values survived headset power-off > 10s, then
+  on, then re-pair via dongle.
+- **Factory reset reliably re-applies patched firmware defaults.**
+  After reset, `0x142039AC` snapped to `8D 8F` = `0xF665` patched
+  value (141/143). This is the strongest evidence that the custom
+  firmware patches are live in the device.
+- **Some balance values are rejected by validation.** Specifically,
+  writing R=`0x8E` (142) is silently rejected — the buffer reverts to
+  the previous value (or to NVDM, unclear). Values 0x8C, 0x8D, 0x8F,
+  0x90, 0x93, 0x9A all worked. `0x8E` specifically is blocked. Cause
+  unknown — could be a reserved sentinel, a saturation gate, or some
+  encoding-specific check in the writer at `0x817B132+`.
+
+### Disproven
+
+- **Per-source NVDM keys are NOT actually used as such at runtime.**
+  After factory reset, on dongle hardware, the buffer loaded
+  `0xF665` (USB-C key) value, not `0xF668` (dongle key). Through all
+  test events while on dongle, `0xF668` value never appeared in the
+  runtime buffer.
+- **The Audeze app sending `0x2F sub` to "tell the chip about source
+  changes" does not cause a per-source reload.** We sent state=0 and
+  state=10 via RACE; nothing changed.
+
+### Unknown / still open
+
+- **What exactly triggers the loader function calls.** They have code
+  callers in firmware that we haven't found via simple BL scans
+  (possibly indirect calls, function pointer tables, or interrupt
+  handlers). Boot-init code path likely calls one of them at startup.
+- **Why the boot-init path always picks `0xF665`.** Perhaps default
+  state is 10 (USB-C) on boot. Perhaps the wrong loader is the only
+  one wired into boot. Untested theory: if the state actually got set
+  to non-10 between boot and loader-call, would `0xF668` get loaded?
+- **Whether `NVDM 0xF668` was actually written during our factory
+  init.** We didn't verify NVDM 0xF668 contents directly. Possible that
+  the patched factory init (which uses `nvdm_write_default` = "write
+  if not exists") didn't actually re-write `0xF668` because it wasn't
+  empty after the reset.
+- **What event was supposed to call the loader on source change.**
+  There is clearly intent in the firmware to use the per-source
+  design (storage is there, two loader functions exist), but the
+  hookup is incomplete or broken.
+
+## Hypothesis: this design bug may explain community-reported issues
+
+Users in the Maxwell community frequently report:
+- "Balance suddenly shifted to one side"
+- "Audio sounds different after some events" (sleep/wake, pair changes)
+- "Sometimes balance is fine, sometimes it's terrible"
+
+If the loader functions DO occasionally get triggered (by some events we
+haven't identified yet — maybe BT pair/unpair, factory event, specific
+RACE sequences), then a stale or incorrect `NVDM 0xF702` source-state
+value could cause the chip to load the WRONG NVDM key, producing
+seemingly-random balance shifts. Investigating what triggers loader runs
+in normal operation is high-priority RE work.
+
+## RACE balance value validation rejection
+
+Empirically tested write values (sent via RACE 0x0900 sub 0x29 LEFT and
+sub 0x2A RIGHT):
+
+| Value | Result |
+|-------|--------|
+| `0x8C` (140) | accepted, buffer updated |
+| `0x8D` (141) | accepted |
+| **`0x8E` (142)** | **REJECTED, buffer not updated (silently reverted)** |
+| `0x8F` (143) | accepted |
+| `0x90` (144) | accepted |
+| `0x93` (147) | accepted |
+| `0x9A` (154) | accepted |
+
+A more thorough sweep is needed to map the full rejected set. The validation
+logic is somewhere in the cmd 0x0900 sub 0x29/0x2A write handler
+(starting at `0x817B132` per the dispatcher analysis); decoding it would
+explain why `0x8E` specifically is blocked.

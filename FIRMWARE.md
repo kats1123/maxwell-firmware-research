@@ -134,10 +134,32 @@ python airoha_decrypt.py --no-decrypt --from Maxwell_v1.0.1.74_XBOX_headset.bin 
 0x08000000+    ROM/Flash, code           (~2.1 MB used)
 0x14000000+    SRAM (data, audio mixer)
 0x14201xxx     Per-stream gain config structs
-0x14229E58     Audio context base (gain bytes, channel selectors)
+0x14229E58     Audio context base (channel selectors at +0x3B/+0x6C/+0xCB/+0xFC)
+0x14203900+    Audio sub-region: per-channel slot table (32 bytes per slot, marker 0x43 every 32 bytes)
+0x142039AC     ★ LIVE L/R BALANCE BUFFER (4 bytes: L, R, slider, dir) — single shared buffer for USB-C AND dongle audio
 0x14230Bxx     Factory EQ defaults (RAM mirror)
 0x4200xxxx     Audio hardware registers (memory-mapped I/O)
 ```
+
+### NVDM-to-runtime balance loader functions
+
+Two functions in firmware load `0x142039AC` from NVDM based on current
+source state (`NVDM 0xF702`):
+
+| Function | Code addr | Inner NVDM read | Notes |
+|----------|----------|------------------|-------|
+| Loader A (async) | `FUN_0x081DDFD4` | `bl 0x814fed8` | Only known BL caller is `0x817B250` (inside cmd 0x0900 handler — runs on RACE balance writes) |
+| Loader B (sync)  | `FUN_0x081DE2E4` | `bl 0x814feac` | Direct callers not yet traced. Likely the one invoked by boot init. |
+
+Both pick `NVDM 0xF665` if state==10 (USB-C), else `0xF668`. Both write
+the result into `0x142039AC`. **Empirical observation: nothing routine
+in normal operation seems to call either loader after boot** — physical
+source change does not, RACE source-state change (sub 0x2F) does not.
+This means the chip uses whichever NVDM key was loaded at boot for all
+subsequent audio (regardless of physical source), until a RACE balance
+write happens (which writes directly to the buffer AND to NVDM `0xF665`).
+See [AUDIO.md](AUDIO.md) §Runtime balance behavior for the full
+empirical test log.
 
 ### Audio hardware register heat map
 

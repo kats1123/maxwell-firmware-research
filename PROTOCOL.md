@@ -11,11 +11,19 @@ paper on Airoha vulnerabilities](https://static.ernw.de/whitepaper/ERNW_White_Pa
 | **VID** | `0x3329` (Audeze) |
 | **PID** (Xbox dongle) | `0x4B18` |
 | **PID** (PS dongle) | `0x4B19` |
-| **PID** (USB-C cable) | `0x4B1E` |
+| **PID** (PS USB-C cable) | `0x4B1A` |
+| **PID** (Xbox USB-C cable) | `0x4B1E` |
 | **HID usage page** | `0xFF13` (vendor-defined) |
 | **Interface** | `mi_00 col02` (the second HID collection) |
-| **Output report ID** | `0x06` (writes from host) |
-| **Input report ID** | `0x07` (reads back from device) |
+| **Output report ID** | `0x06` (writes from host, 62-byte fixed length) |
+| **Input report ID** | `0x07` (reads back from device, 62-byte fixed length) |
+
+The HID Report descriptor caps Output reports at **62 bytes total** (1 byte
+report ID + 61 bytes data). Any RACE packet bigger than 59 bytes (62 - 1
+report ID - 2 length bytes) must be **fragmented across multiple HID
+reports** — first report carries the total length, continuation reports
+carry chunks. See [FLASHING.md](FLASHING.md) for the WriteFlashPage case
+where this matters most (each page write is ~263+ bytes per chunk).
 
 Reads use **polled `HidD_GetInputReport`**, NOT interrupt `ReadFile`. The
 device fills its input report when it has data; the host polls.
@@ -47,8 +55,8 @@ rpt                      0x0900 0x28 0x8D
 
 ## Command dispatch table
 
-Located at file offset `0x26B850` in v1.0.1.63 decompressed firmware (slightly
-different in v74). The table consists of 30 entries of 8 bytes each:
+Located at file offset `0x26B850` in v1.0.1.63 and **`0x26B8E0`** in v1.0.1.74
+(decompressed firmware). The table consists of 30 entries of 8 bytes each:
 
 ```
 [cmd_start:u16] [cmd_end:u16] [handler_fn_ptr:u32]

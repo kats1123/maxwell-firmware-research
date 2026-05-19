@@ -104,7 +104,7 @@ internally dispatches on the **full 16-bit cmd_id**:
 
 | Cmd | Handler addr | What it does |
 |-----|-------------|--------------|
-| `0x0900` | `0x0817B0E4` | Has its own sub-command dispatcher (TBB at `0x0817B122`) — **12 sub-commands** (`0x00`–`0x0B`), all undocumented. Response is 3 bytes. |
+| `0x0900` | `0x0817B0E4` | Has its own sub-command dispatcher (TBB at `0x0817B122`). 12 sub-cmd slots (`0x00`–`0x0B`), but only **4 are functionally distinct**: `0x00` and `0x0B` share `0x0817B15C`; `0x04` → `0x0817B19A`; `0x0A` → `0x0817B1AE`. Others return without action. Response is 3 bytes. All undocumented. |
 | `0x0901` | `0x0817B410` | **Big sub-command dispatcher — see below** (50 sub-commands `0x00`–`0x31`) |
 | `0x0910` | `0x0817B374` | Status query — returns 10-byte struct. Each byte is read from a different getter (`FUN_81AFDDC`, `FUN_8136C70`, `FUN_8144D38`, `FUN_81C9C3C`, `FUN_81C9528`, `FUN_81C956C`, `FUN_81CCB4C`). Likely telemetry (state flags, possibly temperature, battery level, source state). |
 | `0x09FD` | `0x0817B8A0` | (undocumented) |

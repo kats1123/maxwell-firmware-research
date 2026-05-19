@@ -235,6 +235,73 @@ write the result into `0x142039AC`. Since Loader B is unreachable, the
 `NVDM 0xF668` (BT/dongle balance) key is effectively **write-only from
 factory init** — nothing in the firmware ever reads it at runtime.
 
+### Source-state machine (December 2025 — task #6 findings)
+
+There is no in-RAM cached "current source" variable. Source state is
+read from **NVDM `0xF702`** every time something consults it.
+
+**`FUN_0x0817B2F4` — the canonical "get source state" function**:
+
+```c
+uint8_t get_source_state(void) {
+  uint8_t state = 0xFF;  // default if read fails
+  if (nvdm_read(0xF702, &state, 1) == 0)
+    return state;
+  return 0;  // log + return 0 on failure
+}
+```
+
+**6 callers of this getter** (recovered via exhaustive BL/B.W scan):
+
+| Call site | Where (context) |
+|-----------|-----------------|
+| `0x0817B874` | RACE handler area (likely cmd 0x0900 sub 0x2F path) |
+| `0x081C96F8` | Unidentified — high-priority next investigation |
+| `0x081DDFD8` | Inside slider handler `FUN_0x081DDFD4` (Loader A) |
+| `0x081DE09C` | Inside balance writer `FUN_0x081DE094` |
+| `0x081DE160` | Also inside balance writer (different code path) |
+| `0x081DE2E8` | Inside dead-code Loader B `FUN_0x081DE2E4` |
+
+A sister function `FUN_0x0817B334` reads **NVDM `0xF700`** (note: a
+DIFFERENT key). 0xF700 is currently undocumented and only used here —
+add to NVDM key inventory open questions.
+
+**The source-state DISPATCHER `FUN_0x08154BA8`** is invoked from
+5 sites (4 B.W tail calls + 1 BL):
+
+| Call site | Kind |
+|-----------|------|
+| `0x08152D78` | B.W (tail) |
+| `0x08152DEA` | B.W (tail) |
+| `0x08152E70` | B.W (tail) |
+| `0x08152EF2` | B.W (tail) |
+| `0x081530EA` | BL |
+
+The dispatcher receives a **transition code in `r4`** (values 1, 2, 4,
+0xF1, 0xF2 are recognized; others fall to default) — distinct from the
+NVDM `0xF702` value. Each transition code triggers a specific reset
+function:
+
+| Transition code | Action |
+|-----------------|--------|
+| `1` | Call `0x08156F48` (audio context reset — **this is the call the user's patch NOPs at `0x08154C66`**) |
+| `2` | Call `0x081590A8` |
+| `4` | Call `0x0815A508` |
+| `0xF2` | Call `0x08156F48` (same as state 1) |
+
+A second nearby dispatcher at `0x08154C9C+` handles a related state set
+(values 1, 2, 4, 0xF1) and calls different reset functions
+(`0x08156F9C`, `0x081590BC`, `0x0815A51C`). The user's PATCHES.md
+references this as the "site 2" patch (NOP at `0x135CC4`), though in
+the current custom build only the `0x135C66` patch is applied.
+
+**Implication for runtime balance**: nothing in the source-state
+dispatcher reads `0x142039AC` or calls the loader cluster. So even
+when the chip undergoes a source transition (USB plugged, BT connected,
+etc.), the runtime balance buffer is NOT reloaded from NVDM. Confirms
+empirical observation that physical source switch doesn't change the
+runtime balance.
+
 ### Boot-time SRAM map (full)
 
 The reset handler at runtime `0x08133000` calls a memcpy helper at

@@ -235,23 +235,90 @@ all active streams) before setting up the new mode. This is a software-only
 restriction — the hardware mixer can route up to 3 different streams
 simultaneously to different channels.
 
-**Status (Dec 2025)**: NOPing the `BL FUN_00137F48` instruction at file
-offset `0x135C66` (runtime `0x08154C66`) is one of the patches applied in
-the working custom-firmware build documented in [FLASHING.md](FLASHING.md).
-The patch was successfully flashed and verified live in flash. **However**,
-empirical testing showed this fixes only some source-pair combos, not all:
+**Status (Dec 2025)**: There are actually TWO patches needed for full
+concurrent playback across all source combos. Both live in the same
+*audio-source dispatch* code region (file offsets `0x135Cxx`):
 
-- ✅ USB-C ↔ BT path (which our patched BL gates) works
-- ❌ BT ↔ dongle path still kills the previous source
+### Patch 1: `0x135C66` — fixes USB-C↔BT
 
-The function `FUN_00137F48` has only one external entry point (and one
-recursive self-call inside the function itself); we scanned for all BL/BLX
-to that address with a custom decoder and confirmed only those two sites
-exist. So **the BT+dongle case uses a DIFFERENT reset function** that we
-haven't yet identified. Suggested next investigation: trace through
-`FUN_0015C91C` (the RACE 0x900 sub-command handler) starting from sub 0x2F
-(source state change), and look at what gets called when state transitions
-between BT and dongle modes specifically.
+`BL FUN_00137F48` (router_reset) — the simpler reset, just sets all
+three channel selectors to `0xFF` (disabled). Function body decoded:
+
+```
+push {r3, lr}
+bl  printf("source reset")
+bl  FUN_8155D28               ; sub-helper (more state cleanup)
+ldr r3, [audio_ctx_base]
+movs r2, #0xff
+strb r2, [r3, #0x3b]          ; selector A = 0xFF (disabled)
+strb r2, [r3, #0xcb]          ; selector B = 0xFF
+strb r2, [r3, #0x6c]          ; selector C = 0xFF
+strb r2, [r3, #0xfc]          ; selector D = 0xFF  (a 4th selector we hadn't seen)
+str  r1, [r3, #0x40]          ; zero ctx[+0x40]
+str  r1, [r3, #0xd0]          ; zero ctx[+0xd0]
+str  r1, [r3, #0x70]          ; zero ctx[+0x70]
+str  r1, [r3, #0x100]         ; zero ctx[+0x100]
+ldr r3, [pc, #0x18]
+movw r2, #0x101
+strh r2, [r3]                  ; flag = 0x0101
+strh r2, [r3, #0x44]
+pop  {r3, pc}
+```
+
+This patch alone enables some source-pair combos but **not BT↔dongle**.
+
+### Patch 2: `0x135CC4` — fixes BT↔dongle
+
+`BL FUN_00137F9C` (`bigger_router_reset`) — a separate, more
+aggressive reset. Lives in a *state-dispatch function* at `0x08154C9C`
+that switches on a "transition state byte":
+
+```
+ldrb r3, [state_ptr]
+cmp  r3, #4
+beq  state4_handler   ; just calls printf
+bhi  check_F1         ; if r3 > 4: check for 0xF1
+cmp  r3, #1
+beq  state1_handler   ; calls bigger_router_reset
+cmp  r3, #2
+beq  state2_handler   ; calls FUN_00139_0BC (different reset)
+bl   default_handler  ; FUN_00133_A3C (small no-op)
+
+check_F1:
+cmp  r3, #0xf1
+bne  default_handler
+state1_handler:
+bl   FUN_00137F9C     ; bigger_router_reset
+```
+
+State 1 and state 0xF1 both call `bigger_router_reset`. The function does:
+- Iterates 4 stream pointers in the state struct (at `+0x40`, `+0xD0`,
+  `+0x70`, `+0x100`)
+- For each non-null pointer, calls `FUN_0013E3EC` (a stream-stop helper)
+- Then calls back into `FUN_00137F48` (the original router_reset)
+
+So patching `0x135CC4` (NOPping the BL to `bigger_router_reset`) skips this
+whole "stop all wireless streams" cascade. This is suspected to be the
+BT↔dongle case (state 1 or 0xF1 = "switching between wireless sources").
+
+### Patch 3 (optional/aggressive): `0x135CCA` — state 2 reset
+
+Same dispatch function, BL to `FUN_00139_0BC` (state 2 = "switching to
+dongle"?). That function kills streams at struct offsets `+0x34` and
+`+0x98` (a DIFFERENT set than bigger_router_reset). Patching it might
+enable even more concurrent combos but is riskier — state 2 might be a
+required normal transition path.
+
+Bytes at `0x135CCA`: `04 F0 F7 F9` (BL `0x081590BC`) → patch to
+`00 BF 00 BF` (NOPs).
+
+### What we haven't done
+
+The `FUN_0815_90BC` (state 2) call site isn't included in the default
+patcher build. Empirical testing with patch 1 + patch 2 enabled should
+clarify whether patch 3 is also needed. If a user reports "still no
+BT↔dongle concurrent after both patches applied", patch 3 is the next
+candidate.
 
 ## Audio codecs supported
 

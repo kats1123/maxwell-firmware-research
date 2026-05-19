@@ -518,7 +518,26 @@ defaults persistently.
 | `0xF66D` | ? | ? | (read only) | Unknown — 2 movw refs |
 | `0xF66E` | 2 | `0x0901` | `0x186CDE` | **Unknown audio flag** — written by same factory init function. Two-byte value `09 01`. Possibly source-state mask, codec selector, or audio-routing flag. 3 movw refs total. |
 | `0xF670` | ? | ? | (read only) | Unknown — 2 movw refs |
-| `0xF778` | ? | ? | (read only) | **Newly discovered (Dec 2025).** Read by `FUN_0x081DE058` (caller `0x0817B794`, likely sub `0x31`). Purpose unknown. May be paired audio-routing config alongside `0xF665`/`0xF668`. |
+| `0xF778` | 1 | ? | (read only) | **Newly discovered (Dec 2025).** Read by `FUN_0x081DE058` (caller `0x0817B794`, sub `0x31`). **Also WRITTEN by `FUN_0x081DE094` at the START of every balance write** (`movw r0, #0xf778; bl 0x814fed8` — runtime `0x081DE0AC`). So 0xF778 holds the last-written balance byte. Acts as a "last operation log" for balance writes. |
+| `0xF66C` | 3 | ? | (boot read) | **Discovered via boot init trace.** Read by `FUN_0x081DEFE0` (called from main `FUN_0x081D9354` at boot). Second byte passed to `FUN_0x081DEE88` (purpose TBD). Likely an audio sub-config. |
+| `0xF666` | 1 | `0x0X` (low 4 bits) | (boot read) | **Discovered via boot init trace.** Read by main `FUN_0x081D9354` at boot. Low 4 bits passed to `FUN_0x081AFE04` which stores to a 1-byte SRAM flag. Probably a routing/mode flag. |
+| `0xF667` | 1 | ? | (boot read) | **Discovered via boot init trace.** Read by main `FUN_0x081D9354` at boot. Passed to `FUN_0x081C9B84` (purpose TBD). |
+| `0xF700` | 1 | `0xFF` (default if missing) | (read only) | **Newly discovered.** Read 3× (`0x0817B30A`, `0x0817B34A`, `0x081C460E`). The `FUN_0x0817B334` sister to source-state-getter. Purpose unknown but appears to be a state byte parallel to `0xF702`. |
+| `0xF702` | 1 | `0xFF` | (RACE-set) | **Source state** (10 = USB-C, 0x88 etc per ERNW notes). Read only by `FUN_0x0817B2F4`. Written by RACE cmd 0x0900 sub 0x2F via `0x0817B2B2`. **No internal code consults this for audio routing** (i.e. the firmware does not auto-load NVDM balance based on physical source — it's user-settable but unused inside audio path). |
+| `0xF703` | 10 | ? | (read only) | Read at `0x081C970C`. Likely related to source state cluster (0xF702-0xF706). |
+| `0xF704` | ? | ? | (read only) | Read at `0x081C9774`. |
+| `0xF705` | ? | ? | (read only) | Read at `0x081C983E`. |
+| `0xF706` | 1 | ? | (read only) | Read at `0x081C97C8`. |
+| `0xF600` | 1 | ? | (read only) | Read at `0x081C9CA0`. |
+
+**Total NVDM inventory** (from `tools/find_all_nvdm_reads.py` + `find_all_nvdm_defaults.py`): 164 read sites across **~70 unique keys**. Most are infrequently-accessed audio/BT config. Highlights for balance/audio specifically:
+
+- `0xF665` (USB-C balance): read at exactly 1 BL — `0x081DE2FC` inside dead-code Loader B.
+- `0xF668` (BT/dongle balance): read shares the same BL (r0 reassigned). Not separately read.
+- `0xF666`, `0xF667`, `0xF66C`: each read once at boot init chain — these ARE live config keys.
+- `0xF66B`, `0xF66D`, `0xF669`, `0xF66A`, `0xF670`: each read once elsewhere (specific subsystems).
+
+
 | `0xE091` | 6 | ? | `0x18CA3E` (?) | Unknown 6-byte struct |
 | `0xE1E0` | 12 | first 2 bytes `0x7FFF` | `0x248A6C` | Likely **volume / gain limiter struct**. `0x7FFF` = INT16 max — classic max-cap value. 12 bytes suggests {max_left, max_right, current_left, current_right, ...} or biquad coefficients. |
 | `0xE1E1` | ? | ? | (related) | Companion to `0xE1E0` |

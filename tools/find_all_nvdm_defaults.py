@@ -12,10 +12,13 @@ function 0x081AF824 is nvdm_write_default(key, buf, len). Each call site:
 By finding all of these, we know what's patchable persistently.
 """
 import lzma, struct
-import capstone
+import capstone, sys
 md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB)
 
-FW = r"C:\Users\Jona\Downloads\maxwell-firmware-tool\firmware\Maxwell_v1.0.1.74_XBOX_headset.bin"
+if len(sys.argv) < 2:
+    print("Usage: python find_all_nvdm_defaults.py <Maxwell_v1.0.1.74_XBOX_headset.bin>")
+    sys.exit(1)
+FW = sys.argv[1]
 with open(FW, "rb") as f:
     raw = f.read()
 payload = raw[0x1000:]

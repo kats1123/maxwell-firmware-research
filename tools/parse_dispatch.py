@@ -1,7 +1,13 @@
-"""Parse the RACE dispatch table and identify all command ranges."""
-import lzma, struct
+"""Parse the RACE dispatch table and identify all command ranges.
 
-FW = r"C:\Users\Jona\Downloads\maxwell-firmware-tool\firmware\Maxwell_v1.0.1.74_XBOX_headset.bin"
+Usage: python parse_dispatch.py <Maxwell_v1.0.1.74_XBOX_headset.bin>
+"""
+import lzma, struct, sys
+
+if len(sys.argv) < 2:
+    print("Usage: python parse_dispatch.py <Maxwell_v1.0.1.74_XBOX_headset.bin>")
+    sys.exit(1)
+FW = sys.argv[1]
 with open(FW, "rb") as f:
     raw = f.read()
 payload = raw[0x1000:]

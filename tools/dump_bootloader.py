@@ -1,14 +1,24 @@
-"""Dump the bootloader region of flash, 0x08000000 - 0x08013000."""
+"""Dump the bootloader region of flash, 0x08000000 - 0x08013000.
+
+Usage: python dump_bootloader.py [output.bin]
+
+Requires the headset connected via USB-C (PID 0x4B1A for PS, 0x4B1E for Xbox).
+"""
 import struct, time, hid, sys
 
-VID, PID = 0x3329, 0x4B1E
+VID = 0x3329
+# Accept any USB-C PID (0x4B1A=PS, 0x4B1E=Xbox)
+PIDS = [0x4B1A, 0x4B1E]
 START = 0x08000000
 END   = 0x08013000
 
+outpath = sys.argv[1] if len(sys.argv) > 1 else "maxwell_bootloader.bin"
+
 def find_race_path():
     for d in hid.enumerate():
-        if d['vendor_id']==VID and d['product_id']==PID and d['usage_page']==0xFF13:
+        if d['vendor_id']==VID and d['product_id'] in PIDS and d['usage_page']==0xFF13:
             return d['path']
+    return None
 
 class R:
     def __init__(self):
@@ -58,7 +68,6 @@ for i, addr in enumerate(range(START, END, 0x100)):
         print(f"  {i}/{total_pages} pages ({i*256/1024:.0f} KB)  {elapsed:.1f}s")
 r.close()
 
-outpath = r"C:\Users\Jona\Downloads\race-toolkit\maxwell_bootloader.bin"
 with open(outpath, "wb") as f:
     f.write(out)
 print(f"\nWrote {len(out)} bytes to {outpath}")

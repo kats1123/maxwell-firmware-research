@@ -169,11 +169,33 @@ effectively write-only from factory init code; the runtime never writes
 it. See [AUDIO.md](AUDIO.md) §Runtime balance behavior for the full
 empirical observation log.
 
-**Validation rejection**: writing value `0x8E` (142) to either gain
-channel is silently rejected — the buffer reverts to the previous value
-or NVDM-loaded value. Values 0x8C, 0x8D, 0x8F, 0x90, 0x93, 0x9A all
-work. The validation logic in the cmd 0x0900 write handler (somewhere
-around `0x817B132+`) is undecoded. Reason unknown.
+**Validation rejection — DECODED** (December 2025, via static analysis
+of `FUN_0x081DE094` — the actual balance-write function):
+
+The write function at `0x081DE094` (called from `0x0817B27A` inside
+the cmd 0x0900 sub-dispatcher) starts by comparing the incoming value
+against two specific sentinels BEFORE writing to `0x142039AC`:
+
+```
+0x081de0b4  cmp r3, #0x88
+0x081de0b6  beq #0x81de0f4   ; if val == 0x88, take SPECIAL branch
+0x081de0b8  cmp r3, #0x8e
+0x081de0ba  beq #0x81de0ec   ; if val == 0x8e, take REJECT branch
+0x081de0bc  ... normal write path (writes byte to 0x142039AC[0] and/or [1]) ...
+```
+
+| Value | Behavior |
+|-------|----------|
+| `0x88` (136) | **Special-cased** — does NOT take the normal write path. Likely "reset to default" code path. This is also the **boot-init default** value the .data section loads into `0x142039AC` (see [FIRMWARE.md](FIRMWARE.md) §How 0x142039AC is initialized). |
+| `0x8E` (142) | **Silently rejected** — branches away from the writer entirely. No NVDM update either. |
+| any other value | Normal write: stores to `0x142039AC[0]` (if LEFT bit set in route mask) and/or `0x142039AC[1]` (if RIGHT bit set), then calls internal helper `FUN_0x081DDF78`, then writes the new 4-byte struct to either `NVDM 0xF665` (state==10) or `NVDM 0xF668`. |
+
+**Why these sentinels?** Speculation: `0x88` is reserved as the "default
+identity" value (since boot loads it directly), and `0x8E` may be
+reserved for an internal signaling purpose — possibly tied to the
+audio gain look-up table where some specific entries are mapped to
+non-balance behaviors. This remains the most likely high-value next
+investigation.
 
 The gain sub-commands (`0x28`/`0x29`/`0x2A`) all share the same handler at
 `0x0817B754`, which routes by sub-cmd value to `FUN_001BF04C(val, channel)`

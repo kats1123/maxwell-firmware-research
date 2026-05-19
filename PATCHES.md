@@ -138,8 +138,47 @@ privilege escalation in the active firmware.
    For patch `0x186C72`: read flash at `0x081A5C72`, confirm bytes match
    your patched values.
 3. If verifying balance patches specifically: after factory reset, the
-   new defaults should be loaded into the audio context at runtime. The
-   exact runtime address where they land is `0x142039AC` (per fallback
-   path xref), though async NVDM loading makes timing tricky — listen
-   to determine if the new defaults are active rather than relying on
-   live reads.
+   new defaults are written into the NVDM partition. **However, see the
+   important caveat below about whether NVDM values are actually applied
+   to runtime audio.**
+
+## CRITICAL CAVEAT — NVDM balance patches may not actually change audio
+
+(December 2025 finding via static analysis — see [FIRMWARE.md](FIRMWARE.md)
+§How `0x142039AC` is actually initialized and §Loader-cluster function map.)
+
+The two balance-default patches above (`0x186C72` and `0x186CA4`) only
+modify what gets WRITTEN to NVDM `0xF665`/`0xF668` during factory init.
+**They do NOT modify the values that get loaded into the runtime audio
+buffer at `0x142039AC` at boot or source switch.**
+
+Specifically:
+
+- The runtime balance buffer `0x142039AC` is initialized at every cold
+  boot to `0x88 0x88 0x00 0x00` (L=136, R=136, slider=0, dir=0) via a
+  .data-section flash-to-SRAM copy in the reset handler. This value
+  comes from flash address `0x082A6F48` (file offset `0x287F48`), NOT
+  from NVDM.
+- The "NVDM-to-runtime balance loader" function `FUN_0x081DE2E4` exists
+  in firmware but has **zero callers** anywhere — it's dead code.
+- The other loader-cluster function (`FUN_0x081DDFD4`) only fires on a
+  RACE balance write — it's not invoked at boot or on source switch.
+- The balance-writer function `FUN_0x081DE094` has **separately
+  hardcoded** default values for its `0x88` and `0x8E` sentinel inputs
+  (at runtime offsets `0x081DE0F0`, `0x081DE0F8`, `0x081DE104`,
+  `0x081DE108`, `0x081DE114`, `0x081DE118`). These constants are NOT
+  patched by any current patch. They contain stock values like 0x8D/0x95
+  regardless of how we patched NVDM defaults.
+
+**Practical implication**: if you flash patches `0x186C72` and `0x186CA4`
+and observe that runtime audio is affected, the mechanism is not the
+direct NVDM-to-runtime path. It must go through some other code path
+that we have not yet identified, OR the persistent buffer state from a
+previous RACE write is what you're observing.
+
+To make balance patches reliably affect runtime audio at every boot
+without depending on host-side intervention, additional patch sites in
+the loader cluster (around `0x081DE094`) need to be identified — or a
+new patch needs to be designed to make `FUN_0x081DE2E4` (the dead-code
+loader) actually get called during boot. This is the highest-priority
+open research question on this project.

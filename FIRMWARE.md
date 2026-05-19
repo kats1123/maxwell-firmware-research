@@ -123,10 +123,80 @@ python airoha_decrypt.py --no-decrypt --from Maxwell_v1.0.1.74_XBOX_headset.bin 
 | **SoC** | Airoha AB1568 (= MediaTek MT2822) |
 | **CPU** | ARM Cortex-M4F |
 | **SDK** | Airoha IoT_SDK_for_BT_Audio v3.4.1 |
+| **RTOS** | **FreeRTOS** (confirmed by string literals: `freertos`, `Tmr Svc`, `stack overflow: %x %s`, `port.c`) |
 | **Code load base** | `0x08000000` (standard Cortex-M flash region) |
 | **SRAM region** | `0x14000000` |
 | **Audio HW regs** | `0x42000000`–`0x4200FFFF` (78 distinct addresses used) |
 | **Total code** | ~3.2 MB decompressed |
+
+## FreeRTOS task model
+
+### Central task-def array
+
+There is a static `task_def_t[]` array at file offset `0x2741DC` (runtime
+`0x082917DC`) with 20-byte entries:
+
+```c
+struct task_def {
+  void (*entry_fn)(void *param);  // +0x00  (Thumb-mode pointer, low bit set)
+  const char *name;               // +0x04
+  uint32_t stack_size;            // +0x08  (in words — multiply by 4 for bytes)
+  uint32_t reserved;              // +0x0C  (always 0 in observed entries)
+  uint32_t priority;              // +0x10
+};
+```
+
+Six tasks are created from this array. These are the **core dispatch tasks**:
+
+| Task | Entry function | Stack (words) | Priority | Likely role |
+|------|---------------|---------------|----------|-------------|
+| `UI_realtime` | `0x081d27f0` | 0x177 (375) | 7 | Real-time UI / button handling |
+| `bt_task` | `0x0818012c` | 0x300 (768) | 6 | Bluetooth stack main loop |
+| `ATCI` | `0x081d96f0` | 0x300 (768) | 5 | AT-command interpreter (handles `AT+ECHAR=...`, `AT+EAUDIO=...`) |
+| `race command` | `0x081757c8` | 0x200 (512) | 4 | **RACE protocol task** — every HID RACE packet ends up here |
+| `AM_Task` | `0x081a9448` | 0x380 (896) | 7 | Audio Manager — likely the main audio routing/mixing task |
+| `controler_test_task` | `0x081da20c` | 0x280 (640) | 6 | Controller test mode |
+
+**Implication for the runtime balance behavior**: All RACE balance writes
+(cmd `0x0900` sub `0x29`/`0x2A`) are processed by `race command` task at
+priority 4 — i.e. they run cooperatively with audio (`AM_Task`, pri 7) and
+BT (`bt_task`, pri 6). Audio is higher priority so RACE writes can be
+preempted. The balance write does NOT happen in interrupt context.
+
+### Per-subsystem tasks (separate creation paths)
+
+Additional named tasks exist outside the central array — each subsystem
+creates its own via separate calls (likely `xTaskCreate` or a wrapper):
+
+| Name | Where loaded | Notes |
+|------|--------------|-------|
+| `charger_task` | file `0x140ab4` (data ref), other ref at `0x19bec8` | Charging subsystem |
+| `audio_codec_task` | file `0x197e68` | Audio codec subsystem |
+| `Linear_task` | file `0x19bed4` | Unknown — likely Linear PCM stream task |
+| `battery_charger_task` | file `0x19c664` | Battery management |
+| `ui_shell_task` | file `0x1a04cc` | UI shell / event dispatch |
+| `DTM_TASK`, `DPR_TASK`, `DAV_TASK`, `DHP_TASK` | string cluster at file `0xeb7ba`–`0xeb7d8`, followed by a function-pointer table starting at `0xeb7e0` (entries like `0x08038680`, `0x08038694`, ...) | Lower-layer Bluetooth subsystem tasks. DTM=Direct Test Mode, DPR=?, DAV=Audio/Video Distribution Profile?, DHP=? — likely BT controller / HCI layer |
+
+Static task creation logging format string `xCreate task %s, pri %d` at
+runtime `0x08291e18` is referenced once by code at `0x081d975e` — that
+caller specifically logs `bt_task` creation. Other task creates are not
+logged through this format string.
+
+### Implications
+
+1. **RACE handling is task-context, not ISR-context.** Any RACE handler
+   can do work that blocks (NVDM read/write, mutex acquire), and runs at
+   priority 4 — below audio and BT.
+2. **The 'race command' task is the single point where RACE-driven state
+   changes happen.** It pulls messages off a queue (probably built from
+   USB HID + BT SPP transport adapters) and dispatches via the table at
+   `0x0828A8E0` (see PROTOCOL.md).
+3. **Looking for who else can mutate audio state**: now we know to look
+   for tasks that share state with `AM_Task` (priority 7). If a separate
+   task or callback can rewrite `0x142039AC`, it must coordinate with
+   AM_Task through a mutex or queue. Mapping the synchronization between
+   AM_Task and the loader functions (`0x081DDFD4`/`0x081DE2E4`) is the
+   next step.
 
 ### Memory map (best-known)
 
@@ -141,25 +211,93 @@ python airoha_decrypt.py --no-decrypt --from Maxwell_v1.0.1.74_XBOX_headset.bin 
 0x4200xxxx     Audio hardware registers (memory-mapped I/O)
 ```
 
-### NVDM-to-runtime balance loader functions
+### NVDM-to-runtime balance loader functions — exhaustive caller map
 
 Two functions in firmware load `0x142039AC` from NVDM based on current
 source state (`NVDM 0xF702`):
 
-| Function | Code addr | Inner NVDM read | Notes |
-|----------|----------|------------------|-------|
-| Loader A (async) | `FUN_0x081DDFD4` | `bl 0x814fed8` | Only known BL caller is `0x817B250` (inside cmd 0x0900 handler — runs on RACE balance writes) |
-| Loader B (sync)  | `FUN_0x081DE2E4` | `bl 0x814feac` | Direct callers not yet traced. Likely the one invoked by boot init. |
+| Function | Code addr | Inner NVDM read | Direct BL callers | Indirect (literal-pool) callers |
+|----------|----------|------------------|-------------------|--------------------------------|
+| Loader A (async) | `FUN_0x081DDFD4` | `bl 0x814fed8` | **1** — exactly `0x817B250` (inside cmd 0x0900 handler) | **0** |
+| Loader B (sync)  | `FUN_0x081DE2E4` | `bl 0x814feac` | **0** | **0** |
 
-Both pick `NVDM 0xF665` if state==10 (USB-C), else `0xF668`. Both write
-the result into `0x142039AC`. **Empirical observation: nothing routine
-in normal operation seems to call either loader after boot** — physical
-source change does not, RACE source-state change (sub 0x2F) does not.
-This means the chip uses whichever NVDM key was loaded at boot for all
-subsequent audio (regardless of physical source), until a RACE balance
-write happens (which writes directly to the buffer AND to NVDM `0xF665`).
-See [AUDIO.md](AUDIO.md) §Runtime balance behavior for the full
-empirical test log.
+**Loader B is dead code.** Zero callers anywhere in the firmware (verified
+by exhaustive scan of BL/BLX instructions and 4-byte-aligned literal-pool
+entries containing the function address with or without the Thumb bit set
+— see `tools/find_loader_callers.py`).
+
+**Loader A has exactly one caller**: the cmd 0x0900 balance-write handler.
+It is never invoked from any other code path (no boot init, no source
+switch, no message dispatch, no function pointer table).
+
+Both loaders pick `NVDM 0xF665` if state==10 (USB-C), else `0xF668`, and
+write the result into `0x142039AC`. Since Loader B is unreachable, the
+`NVDM 0xF668` (BT/dongle balance) key is effectively **write-only from
+factory init** — nothing in the firmware ever reads it at runtime.
+
+### How `0x142039AC` is actually initialized at boot
+
+**Discovered via boot-trace** (December 2025 — see
+`tools/find_address_refs.py` + reset-handler disassembly):
+
+The reset handler at runtime `0x08133000` (file offset `0x114000`) runs
+a sequence of .data-section copies from flash to SRAM via a memcpy helper
+at `0x08133158`. One of those copies is:
+
+```
+src     = 0x082A4B84  (flash)
+dst     = 0x142015E8  → 0x142044F4  (SRAM, 12,044 bytes)
+```
+
+`0x142039AC` falls inside this destination range. The bytes copied to
+`0x142039AC` from flash offset `0x082A4B84 + 0x23C4 = 0x082A6F48`
+(file `0x287F48`) are:
+
+| Byte | Value | Field |
+|------|-------|-------|
+| `0x142039AC` | `0x88` | L (initial = 136) |
+| `0x142039AD` | `0x88` | R (initial = 136) |
+| `0x142039AE` | `0x00` | slider |
+| `0x142039AF` | `0x00` | dir |
+
+**Implications**:
+
+1. **At every cold boot, `0x142039AC` initializes to `0x88 0x88 0x00 0x00` (L=136, R=136)** — NOT from any NVDM key.
+2. The NVDM-based runtime balance config (`0xF665` for USB-C, `0xF668` for dongle) is **never loaded at boot**.
+3. The buffer only changes from `0x88 0x88` when something specifically triggers Loader A — and we have proven the ONLY trigger is a RACE balance write (cmd `0x0900` sub `0x29`/`0x2A`).
+4. This explains why after-factory-reset reads of `0x142039AC` matching patched NVDM values must come from a **different code path** that runs during factory reset (not via the .data init). Possibly the factory-reset handler synthesizes an internal RACE balance write to itself, or there is a yet-undiscovered call site for a similar loader function — high-priority next investigation.
+
+### `0x142039AC` reference inventory (exhaustive)
+
+Total references to `0x142039AC` in the firmware: **6 literal-pool entries**,
+all clustered in the loader-function code range (file `0x1BEFC8`-`0x1BF3E4`,
+runtime `0x081DDFC8`-`0x081DE3E4`). Zero `movw`+`movt` pair refs anywhere
+else. **No function outside this cluster touches `0x142039AC` directly.**
+
+### Loader-cluster function map (4 distinct functions)
+
+| Function | Role | Direct BL callers |
+|----------|------|-------------------|
+| `FUN_0x081DDF78` | **DSP-APPLY function** (December 2025 — decoded). Reads all 4 bytes of `0x142039AC` (L, R, slider, dir), then writes them to the DSP via two tail-calls to `FUN_0x081DDF54(reg_id, value, ?)`: first call uses reg_id `0x38` with value `L + slider`, second uses reg_id `0x39` with value `R + dir`. The constant `0x23BA` is passed as the first arg — likely a DSP context/device handle. **This is the bridge between the runtime balance buffer and the actual audio hardware** — until something calls this, changes to `0x142039AC` have no audible effect. Called only from inside the loader cluster (3 internal sites: `0x081DDFEA` inside slider handler, `0x081DE0CC` inside balance writer, `0x081DE318` inside dead-code loader B). | (internal only — no external callers) |
+| `FUN_0x081DDFD4` (= Loader A) | **NVDM-to-runtime async loader.** Reads `NVDM 0xF665` (if state==10) or `0xF668` and copies into `0x142039AC`. The NVDM read uses `bl 0x814fed8` (`nvdm_read`). | **1** — `0x0817B250` (inside cmd 0x0900 handler) |
+| `FUN_0x081DE058` | **NVDM 0xF778 reader.** Reads `NVDM key 0xF778` via `nvdm_read_lock_protect`. The purpose of `0xF778` is currently unknown — see [open question](#unknown-nvdm-keys). | **1** — `0x0817B794` (likely sub `0x31` per PROTOCOL.md) |
+| `FUN_0x081DE094` | **Main balance writer.** Validates input value (`0x88` → special branch, `0x8E` → silent reject), writes byte 0 and/or byte 1 of `0x142039AC` based on a route mask, then writes new state to `NVDM 0xF665` (state==10) or `NVDM 0xF668`. **This is the actual `FUN_001BF04C` from older docs**, but exposed at its real address `0x081DE094`. | **1** — `0x0817B27A` (sub `0x29`/`0x2A`/`0x28` handler) |
+| `FUN_0x081DE2E4` (= Loader B) | **DEAD CODE.** Zero callers anywhere in firmware. Reads `NVDM 0xF665` via `nvdm_read_lock_protect`. Probably an earlier version of Loader A that was superseded but never removed. | **0** |
+
+### Unknown NVDM keys (newly discovered)
+
+`NVDM 0xF778` is read by `FUN_0x081DE058` (caller `0x0817B794`). This key
+is **not** in the previously-documented NVDM inventory. Hypotheses:
+
+- A separate audio-config key paired with `0xF665`/`0xF668` — possibly stores
+  "live channel routing mask" or "slider/dir" data corresponding to the
+  byte 2/3 fields of `0x142039AC`.
+- The cmd `0x0901` sub `0x31` was tagged in PROTOCOL.md as "likely a READ
+  counterpart or alternate channel selector" — `0xF778` may be exactly that.
+
+Next-investigation: dump `NVDM 0xF778` over RACE and compare to other
+known keys; also look for `0xF778` movw refs in the firmware to find
+who writes the default.
 
 ### Audio hardware register heat map
 
@@ -212,8 +350,8 @@ defaults persistently.
 
 | NVDM key | Length | Default | File offset of `movw r0,#key` | Purpose |
 |----------|--------|---------|-------------------------------|---------|
-| `0xF665` | 4 | `0x958D` (L=141 R=149) | `0x186CAC` | **USB-C audio source balance** (state=10) — 4 movw refs across firmware |
-| `0xF668` | 4 | `0x9393` (L=147 R=147) | `0x186C7A` | **BT/dongle audio source balance** (state≠10) — 4 movw refs |
+| `0xF665` | 4 | `0x958D` (L=141 R=149) | `0x186CAC` | **USB-C audio source balance** (state=10) — 4 movw refs across firmware. Loaded by Loader A only. |
+| `0xF668` | 4 | `0x9393` (L=147 R=147) | `0x186C7A` | **BT/dongle audio source balance** (state≠10) — 4 movw refs. **Never read at runtime** (Loader B is dead code; Loader A's branch for state≠10 IS reachable but appears never triggered in practice — physical source switch does not invoke loader). Effectively write-only from factory init. |
 | `0xF666` | ? | ? | (read only) | Unknown — 2 movw refs, likely paired with 0xF665 (USB-C-related sub-config) |
 | `0xF667` | ? | ? | (read only) | Unknown — 2 movw refs |
 | `0xF669` | ? | ? | (read only) | Unknown — 1 movw ref |
@@ -223,6 +361,7 @@ defaults persistently.
 | `0xF66D` | ? | ? | (read only) | Unknown — 2 movw refs |
 | `0xF66E` | 2 | `0x0901` | `0x186CDE` | **Unknown audio flag** — written by same factory init function. Two-byte value `09 01`. Possibly source-state mask, codec selector, or audio-routing flag. 3 movw refs total. |
 | `0xF670` | ? | ? | (read only) | Unknown — 2 movw refs |
+| `0xF778` | ? | ? | (read only) | **Newly discovered (Dec 2025).** Read by `FUN_0x081DE058` (caller `0x0817B794`, likely sub `0x31`). Purpose unknown. May be paired audio-routing config alongside `0xF665`/`0xF668`. |
 | `0xE091` | 6 | ? | `0x18CA3E` (?) | Unknown 6-byte struct |
 | `0xE1E0` | 12 | first 2 bytes `0x7FFF` | `0x248A6C` | Likely **volume / gain limiter struct**. `0x7FFF` = INT16 max — classic max-cap value. 12 bytes suggests {max_left, max_right, current_left, current_right, ...} or biquad coefficients. |
 | `0xE1E1` | ? | ? | (related) | Companion to `0xE1E0` |

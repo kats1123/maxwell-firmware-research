@@ -22,6 +22,7 @@ both via runtime control and via flashing modified firmware.
 | **[PROTOCOL.md](PROTOCOL.md)** | RACE protocol details, HID interface, command dispatch table, NVDM key reference |
 | **[VERSIONS.md](VERSIONS.md)** | Concrete byte-level differences between v1.0.1.63 and v1.0.1.74 |
 | **[FLASHING.md](FLASHING.md)** | FOTA process internals + **working custom-firmware flash recipe** |
+| **[PATCHES.md](PATCHES.md)** | Cookbook of known custom-firmware patches (L/R balance, concurrent playback, etc.) |
 | **[BOOTLOADER.md](BOOTLOADER.md)** | First-stage bootloader (in flash, not ROM), TLV parsing, integrity check details |
 | **[COMMUNITY.md](COMMUNITY.md)** | Remaining open questions, suggested paths forward, tools we used |
 

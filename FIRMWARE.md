@@ -235,6 +235,28 @@ write the result into `0x142039AC`. Since Loader B is unreachable, the
 `NVDM 0xF668` (BT/dongle balance) key is effectively **write-only from
 factory init** — nothing in the firmware ever reads it at runtime.
 
+### Boot-time SRAM map (full)
+
+The reset handler at runtime `0x08133000` calls a memcpy helper at
+`0x08133158` six times to populate SRAM regions from flash. The helper
+signature is `memcpy(r1=src, r2=dst, r3=dst_end)`. Recovered by
+`tools/parse_data_copies.py`:
+
+| # | src flash | dst start | dst end | size | Purpose (inferred) |
+|---|-----------|-----------|---------|------|--------------------|
+| 1 | `0x082A7E50` | `0x04000000` | `0x04025F3C` | 155 KB | "Near" peripheral SRAM (DSP code/RAM, or L2 cache) |
+| 2 | `0x082A359C` | `0x14200000` | `0x142015E8` | 5544 B | Main SRAM .data block 1 |
+| 3 | `0x082A4B84` | `0x142015E8` | `0x142044F4` | 12044 B | **Main SRAM .data block 2 — contains `0x142039AC`** |
+| 4 | `0x082A7A90` | `0x04243860` | `0x04243904` | 164 B | Peripheral config region (DMA descriptors?) |
+| 5 | `0x082A7B34` | `0x04245740` | `0x04245740` | 0 B | Empty copy (placeholder?) |
+| 6 | `0x082A7B34` | `0x0425C000` | `0x0425C31C` | 796 B | Another peripheral config region |
+
+Total: ~173 KB of initialized data copied at boot from flash to SRAM.
+
+The 0x14000000-region SRAM gets ~17.5 KB of .data plus presumably .bss
+zero-init elsewhere. The 0x04000000-region is much larger — 155 KB —
+suggesting that's where the DSP firmware/configuration lives.
+
 ### How `0x142039AC` is actually initialized at boot
 
 **Discovered via boot-trace** (December 2025 — see

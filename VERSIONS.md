@@ -10,14 +10,28 @@ diff of what changed.
   registers)
 - **RACE protocol structure**: Identical (same dispatch table, same command IDs)
 - **Audio mixer code**: Identical (functions in same place)
-- **Factory default gain values**: **Changed for BT/dongle** — the visible
-  behavior change that broke balance for some users
-- **Function offsets**: A handful of functions moved by 0x10–0x280 bytes
-- **Total differing bytes**: **~1.3 million** (~42% of the 3.2 MB
-  decompressed image) — Audeze made substantial changes beyond just the
-  balance defaults. Most diffs are in partition 2 (the main code, file
-  offsets `0x114000`+). What those changes actually do remains
-  unresearched — community RE welcome.
+- **Factory default gain values**: **Changed for BT/dongle** (`L=R=141` →
+  `L=R=147`) — the only meaningful user-visible behavior change
+- **Total differing bytes**: ~1.3 million (~42% of the 3.2 MB decompressed
+  image)
+- **BUT — number of NEW strings in v74 vs v63**: just **3**, all of which
+  are the version string itself and two build timestamps (`2024/09/16`
+  vs `2024/06/03`). NOT new debug strings, error messages, function names,
+  or features.
+
+The 1.3 MB byte diff turns out to be almost entirely **compiler/linker
+artifacts from a clean rebuild** — Audeze recompiled the firmware against
+a newer Airoha SDK or with different optimization flags, which reshuffles
+constant pools, reorders functions, and reallocates registers. None of
+this is user-visible. **The only thing Audeze actually changed in v74 is
+the BT/dongle balance default value.**
+
+This reframes "v74 broke my balance" complaints: stock v74 isn't more
+imbalanced than v63 — it's **+6 dB louder on BT/dongle** (141→147 on both
+channels is a uniform volume bump, not a balance shift), which makes any
+existing hardware imbalance more audible. The "fix" for affected users
+is to either downgrade to v63 (lower BT volume) or patch a custom v74
+with the desired per-channel values (see [PATCHES.md](PATCHES.md)).
 
 ## File-level comparison
 

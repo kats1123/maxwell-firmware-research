@@ -190,9 +190,17 @@ defaults persistently.
 
 | NVDM key | Length | Default | File offset of `movw r0,#key` | Purpose |
 |----------|--------|---------|-------------------------------|---------|
-| `0xF665` | 4 | `0x958D` (L=141 R=149) | `0x186CAC` | **USB-C audio source balance** (state=10) |
-| `0xF668` | 4 | `0x9393` (L=147 R=147) | `0x186C7A` | **BT/dongle audio source balance** (state≠10) |
-| `0xF66E` | 2 | `0x0901` | `0x186CDE` | **Unknown audio flag** — written by same factory init function. Two-byte value `09 01`. Possibly source-state mask, codec selector, or audio-routing flag. |
+| `0xF665` | 4 | `0x958D` (L=141 R=149) | `0x186CAC` | **USB-C audio source balance** (state=10) — 4 movw refs across firmware |
+| `0xF668` | 4 | `0x9393` (L=147 R=147) | `0x186C7A` | **BT/dongle audio source balance** (state≠10) — 4 movw refs |
+| `0xF666` | ? | ? | (read only) | Unknown — 2 movw refs, likely paired with 0xF665 (USB-C-related sub-config) |
+| `0xF667` | ? | ? | (read only) | Unknown — 2 movw refs |
+| `0xF669` | ? | ? | (read only) | Unknown — 1 movw ref |
+| `0xF66A` | ? | ? | (read only) | Unknown — 1 movw ref |
+| `0xF66B` | ? | ? | (read only) | Unknown — 2 movw refs |
+| `0xF66C` | ? | ? | (read only) | Unknown — 2 movw refs |
+| `0xF66D` | ? | ? | (read only) | Unknown — 2 movw refs |
+| `0xF66E` | 2 | `0x0901` | `0x186CDE` | **Unknown audio flag** — written by same factory init function. Two-byte value `09 01`. Possibly source-state mask, codec selector, or audio-routing flag. 3 movw refs total. |
+| `0xF670` | ? | ? | (read only) | Unknown — 2 movw refs |
 | `0xE091` | 6 | ? | `0x18CA3E` (?) | Unknown 6-byte struct |
 | `0xE1E0` | 12 | first 2 bytes `0x7FFF` | `0x248A6C` | Likely **volume / gain limiter struct**. `0x7FFF` = INT16 max — classic max-cap value. 12 bytes suggests {max_left, max_right, current_left, current_right, ...} or biquad coefficients. |
 | `0xE1E1` | ? | ? | (related) | Companion to `0xE1E0` |

@@ -2,159 +2,181 @@
 
 What we know, what's still unknown, and how to pick up where we left off.
 
-## Status summary
+## Status summary (December 2025)
 
 | What | Status |
 |------|--------|
 | Decompress firmware files | ✅ Solved |
 | Map firmware sections / functions | ✅ Mostly mapped |
-| Reverse-engineer RACE protocol | ✅ Done |
+| Reverse-engineer RACE protocol (read paths) | ✅ Done |
+| Reverse-engineer RACE FOTA flow (Audeze-specific) | ✅ Done — needs `0x0101` init before `FotaStart` |
+| Dump first-stage bootloader (in flash) | ✅ Done — 76 KB at `0x08000000`+ |
+| Identify chip-level partition map | ✅ Done (8 entries, including NVDM at `0x087F6000`) |
 | Identify all 0x42xxxxxx hardware registers | 🟡 Block-level mapped; specific register meanings unknown (no datasheet) |
 | Find L/R balance root cause | ✅ Solved (per-source NVDM + hardware variance) |
 | Modify runtime behavior via RACE | ✅ Working |
-| Modify firmware itself | ❌ Blocked by bootloader signature verification |
-| Enable concurrent BT + USB-C playback | ❌ Requires firmware mod (above) |
+| **Modify firmware itself (custom firmware)** | ✅ **Working** — SHA-256-only integrity check, fully recomputable |
+| Find correct LZMA stream size TLV (was missing piece) | ✅ Solved — TLV `0x0011` bytes 6-9 |
+| Concurrent playback patches | 🟡 Two BL sites identified (`0x135C66`, `0x135CC4`); empirical confirmation that this fixes BT+dongle still pending |
+| Boot ROM extraction | ❌ Not done. The TRUE boot ROM at `0x00000000` is unreadable (RACE memory reads crash the chip there). The first-stage bootloader is in flash at `0x08000000`+ and dumpable. |
+| L/R balance live runtime address | 🟡 Suspected at `0x142039AC` (per fallback-path xref). Reads there return zeros — value may only be live during active playback, async-loaded from NVDM. |
 
 ## Confirmed open questions
 
-These are things I encountered but didn't fully resolve. If you're picking up
-this work, these are good starting points:
+These are things we encountered but didn't fully resolve. Good starting
+points for further work:
 
-### 1. What kind of signature is the bootloader checking?
+### 1. Concurrent playback patch verification
 
-We see `ECC` strings in the firmware but no ECC curve constants. The
-verification code and public key are almost certainly in the bootloader ROM.
-Determining whether it's ECDSA P-256, P-384, Ed25519, or something else, and
-what curve/parameters are used, would require dumping the bootloader.
+The custom-firmware build now NOPs both `BL FUN_00137F48` (file `0x135C66`)
+and `BL FUN_00137F9C` (file `0x135CC4`). The first was empirically
+confirmed to work for USB-C+BT; the second has NOT yet been tested on a
+device. If a tester reports BT+dongle still kills previous source, the
+next patch candidate is `BL FUN_0815_90BC` at file `0x135CCA` (state 2
+in the state-dispatch function). That call may also need to be NOPped,
+though it's riskier because state 2 may be a required normal transition.
 
-**How to investigate**: JTAG/SWD on the AB1568 chip (if debug pins are
-accessible on the Maxwell PCB) → dump ROM → analyze.
+### 2. NVDM 0xF66E meaning
 
-### 2. What goes in the third field of partition table entries?
+This 2-byte key is written by the same factory-init function that writes
+the per-source balance defaults (`0xF665`, `0xF668`). Default value
+`0x0901`. Three other reads/writes exist at file offsets `0x1ADD42` and
+`0x1ADD72`. What audio behavior does this control? Possibly: source-state
+mask, codec selector, default audio routing mode. Patchable in firmware
+if we figure out the semantics.
 
-Each partition table entry at file offset `0x130` has the format:
+### 3. NVDM 0xE301 / 0xE304 — PEQ coefficient layout
 
-```
-4 bytes addr | 4 bytes size | 4 bytes ???
-```
+The 564-byte (`0xE301`) and 194-byte (`0xE304`) NVDM defaults are very
+likely DSP/PEQ coefficient blocks. Decoding the format (probably biquad:
+five floats per section × N sections × M filter bands) would let
+community members ship "tuned" firmwares with different baseline sound.
+The 10 EQ presets shown in the Audeze app are likely host-side coefficient
+sets that the app pushes to the device via RACE — not stored per-preset in
+firmware.
 
-The third field has values like `0x13000`, `0x133000`, `0x32C000`, `0x450000`
-for the 4 entries. They look like file offsets but don't match where the
-data actually lives. Could be:
-- Per-partition CRC32 (the values are too "round" to be CRCs though)
-- Offset into a separate signature blob
-- Bank flash address (where the partition will go in flash after copy)
+### 4. LE Audio (LC3) activation
 
-### 3. How does the EQ preset switcher really get triggered?
+Strings `LC3I_Enc_Prcs` and `LC3I_Dec_Prcs` exist in firmware, implying
+LC3 codec code is compiled in. But Maxwell isn't marketed as LE-Audio-
+capable. Investigate whether LE Audio could be activated via a hidden
+config flag or via firmware patch. Would offer better latency and
+ecosystem support (Auracast, LE Audio earbuds compatibility).
 
-`FUN_001AA6E0` swaps EQ presets when source state changes, but we found 0
-direct callers and 0 absolute function-pointer references to it. It must be
-invoked indirectly (RTOS task callback, ARM exception vector, function table
-indexed by computed offset). Tracing this would clarify whether the EQ swap
-happens automatically when audio sources change, or whether the Audeze app
-manually invokes it.
+### 5. The 4th channel selector at `+0xFC`
 
-### 4. What do the 80+ AT+EAUDIO commands actually do?
+In `bigger_router_reset`, an additional channel selector at audio-context
+offset `+0xFC` is also reset to `0xFF` (alongside the three documented at
+`+0x3B`, `+0x6C`, `+0xCB`). What stream type does this 4th selector
+correspond to? Knowing this would clarify the full channel-mixing matrix.
 
-We found the string list but didn't trace what each command does. They appear
-to be a debug interface used during development. Many are obvious from the
-name (`AUD_SET_DEVICE_LEFT`, `PEQ_SYNC`, `VOL_STREAM_2A2D`). Some are not
-(`VENDOR_SE`, `DL_NM`). If the firmware exposes any of these via RACE, they
-could provide additional configuration knobs.
+### 6. Boot state pages `0x08001000` and `0x08002000`
 
-### 5. What's in the 20-byte "factory EQ defaults" block at `0x281AC3`?
+The chip-level partition table reserves two 4 KB regions for boot state
+(see BOOTLOADER.md). They were all-`0xFF` in our flash dump (because the
+device hadn't done a recent FOTA when we read). Dumping these after a
+successful FOTA would reveal what state info the bootloader persists —
+likely the `upgrade_flag`, last-good-firmware index, and possibly a
+boot-counter.
 
-`FUN_00186D04` (factory init) writes 20 bytes from this offset to `NVDM 0xE400`.
-The bytes look like they could be biquad filter coefficients (4-byte stride,
-"random" values typical of DSP coefficients). But we didn't decode the format
-or determine which DSP filter section they populate.
+### 7. What's in the NVDM partition?
 
-### 6. Why does the L/R imbalance change "randomly" on some users' devices?
+`0x087F6000`–`0x08800000` is the live NVDM partition. Our flash-read scan
+got 36 KB into this region (`0x087F5000` start) before encountering a
+read fault at `0x087FEB00`. A more careful scan with smaller per-read
+timeouts might map the entire NVDM region's record format and let us
+read NVDM values directly via flash reads (instead of needing the SDK's
+`CustomReadNvEx` which we couldn't get to work).
 
-Multiple users report that their balance shifts during normal use, sometimes
-fixed by reset, sometimes by reconnecting from a phone. Our investigation
-identified plausible mechanisms (source state desync, EQ preset modification
-via background app commands) but couldn't pin down a single definitive cause.
+### 8. What kind of attack-surface exists in the FOTA module?
 
-**How to investigate**: USB-pcap captures of the device's HID traffic during
-normal operation. The Audeze app may be sending commands that aren't visible
-to the user. Reverse-engineering the app's behavior would clarify this.
+We have plaintext access to the first-stage bootloader. Are there any
+input-validation bugs in the TLV parser that could be exploited to write
+to non-FOTA-partition flash regions? E.g. a bad `mover_info` with
+out-of-bounds `dst_flash_addr` — does the bootloader range-check this
+strictly? If not, it might be possible to overwrite the bootloader itself.
 
 ## High-ROI projects for the community
 
 In order of estimated impact vs. effort:
 
-### Highest ROI: Runtime tray app for per-source balance
+### Already shipped: Custom-firmware patcher
+
+The current [audeze-tray] (when published) `firmware_patcher_v5.py`
+produces flashable v1.0.1.74 custom builds. Patches included:
+
+- BT/dongle balance defaults (`movw r3, #imm16` at file offset `0x186C72`)
+- USB-C balance defaults (file offset `0x186CA4`)
+- Concurrent playback (NOPs at file offsets `0x135C66` and `0x135CC4`)
+
+Iteration loop: change L/R values in the patcher's defaults, rebuild,
+flash, listen, repeat. Each cycle is ~6 minutes (v74→v63→v74-custom).
+
+### Highest ROI: Runtime tray app for per-source balance + custom-firmware patcher
 
 A small PC app that:
-- Watches for USB device events (PID `0x4B18` = Xbox dongle, `0x4B1E` = USB-C)
-- On connect, sends RACE command `0x900 sub 0x2F` to set the source state
-  correctly (10 for USB-C, 0 for BT)
-- Optionally re-applies the user's preferred L/R values via sub 0x29/0x2A
+- Watches for USB device events (PID `0x4B18` Xbox dongle, `0x4B19` PS
+  dongle, `0x4B1A` PS USB-C, `0x4B1E` Xbox USB-C)
+- On connect, queries current L/R balance via RACE
+- Lets user tune live (sliders for L and R), persisting via NVDM writes
+- Optionally bakes their final L/R into a custom firmware build for them
 
-This solves the actual user-facing problem without any firmware risk and
-without needing the Audeze app running. Should be doable in a couple
-hundred lines of Python or C#.
+This solves the actual user-facing problem (per-unit balance variance)
+end-to-end. ~few hundred lines of Python or C#.
 
-### Medium ROI: Decode remaining RACE sub-commands
+### Medium ROI: Decode the EQ preset coefficient format
 
-`FUN_0015C91C` handles sub-commands of `0x0900` up to at least `0x2F` but
-the switch statement likely continues to higher values. Decoding all of them
-might reveal commands we missed that:
-- Write the audio context channel selectors directly (would enable concurrent
-  playback at runtime, NO firmware mod needed!)
-- Modify EQ coefficients directly
-- Provide other useful runtime hooks
+NVDM `0xE301`/`0xE304` clearly hold DSP coefficients. Understanding the
+format (likely biquad with normalized fixed-point floats) would let users
+modify default sound signature. Trickier than balance because the
+coefficients have to be mathematically valid (or audio breaks).
 
-This is just more Ghidra time on the same firmware we have.
+### Medium ROI: USB-pcap captures of Audeze app behavior
 
-### Medium ROI: USB-pcap captures of normal usage
+Some host-side behaviors (EQ preset coefficient pushes, advanced sidetone
+settings, etc.) are sent over HID by the Audeze app. Capturing and
+documenting these commands would expose all the hidden runtime config
+knobs without requiring firmware mods.
 
-Run `USBPcap` while:
-- Audeze app starts
-- Connecting to different devices
-- Switching EQ presets
-- Adjusting volume / chatmix
-- Powering off / on
+### Lower ROI / harder: Bootloader-writable exploitation
 
-This would reveal commands the Audeze app sends that we didn't observe.
+If a TLV-parser bug or out-of-bounds write existed in the first-stage
+bootloader, you could overwrite the bootloader itself and remove the
+SHA-256 check entirely (or add backdoors, sign-key support, etc.). Useful
+for academic research but probably won't pan out — Audeze's TLV parser
+appears to have proper bounds checking based on the strings.
 
-### Lower ROI / harder: Bootloader extraction
+### Lowest ROI but potentially fun: Maxwell V2 cross-port
 
-JTAG/SWD debug access to the AB1568 chip would allow:
-- Dumping the bootloader ROM
-- Reverse-engineering the verification routine
-- Possibly finding a bypass
-
-Requires hardware skills and access to debug pads on the Maxwell PCB.
-
-### Lowest ROI but potentially fun: Maxwell V2 comparison
-
-If/when Maxwell V2 firmware can be obtained:
-- Different SoC? Different security model?
-- Same RACE protocol or evolved?
-- May reveal what Audeze fixed/changed/regressed
+If Maxwell V2 firmware can be obtained and analyzed:
+- Same Airoha SoC family? Same partition layout? Same RACE protocol?
+- Could the V1 community tools (downgrader, patcher) work on V2?
+- What features did Audeze add that we could backport to V1 via firmware
+  patches?
 
 ## Tools used in this research
 
 | Tool | Use |
 |------|-----|
-| **Ghidra 12.0.4** | Primary disassembler/decompiler. Imported decompressed firmware as ARM Cortex-M little-endian, ran auto-analysis. |
-| **Python 3.x + lzma module** | Firmware decompression and recompression experiments |
-| **airoha-firmware-parser** (ramikg) | Drop-in decompressor for Airoha firmware |
-| **pywinusb** | Python HID access on Windows |
-| **AirohaHidCoreLib.dll** | Audeze app's bundled Airoha SDK — what `MaxwellFlasherGUI.exe` uses |
+| **Ghidra 12.0.4** | Initial heavy disassembly/decompilation. Imported decompressed firmware as ARM Cortex-M little-endian, ran auto-analysis. |
+| **Capstone (Python)** | Scriptable inline disassembly for hunting BL targets, decoding patch sites, and matching NVDM-write call sites. |
+| **Python 3.x + lzma module** | Firmware decompression and recompression |
+| **airoha-firmware-parser** (ramikg) | Drop-in decompressor — useful baseline before we built our own |
+| **pywinusb / hidapi (Python)** | HID access on Windows for RACE protocol over USB |
+| **AirohaHidCoreLib.dll** | Audeze app's bundled Airoha SDK — used by GUI flasher for the canonical FOTA path |
+| **ERNW [race-toolkit](https://github.com/auracast-research/race-toolkit)** | Sony-derived RACE Python tooling — useful but doesn't work as-is on Audeze (state-machine quirks) |
 | **Wireshark + USBPcap** | (Recommended) Capture device HID traffic |
 
 ## Code & analysis scripts
 
-The Ghidra scripts and Python helpers used in this research are in the [tools/](tools/)
-directory. They're a starting point, not polished tools — they reflect
-exploration, not a finished product.
+Tooling scripts used during this research will go in the [tools/](tools/)
+directory in a follow-up commit. They're a starting point, not polished
+tools — they reflect exploration, not a finished product.
 
 ## Where to discuss / collaborate
 
 - This repo's [Issues](../../issues) and [Discussions](../../discussions) tabs
+- The companion [maxwell-firmware-downgrader](https://github.com/kats1123/maxwell-firmware-downgrader) repo
 - r/AudezeMaxwell on Reddit
 - head-fi.org Audeze threads
 
@@ -162,6 +184,8 @@ exploration, not a finished product.
 
 - [ramikg](https://github.com/ramikg) for the airoha-firmware-parser
 - [auracast-research](https://github.com/auracast-research) for the race-toolkit
-  and ERNW research
+  and ERNW research that established the RACE protocol baseline
+- ERNW for the public December 2025 disclosure of CVE-2025-20700/20701/20702
+  which clarified the Airoha attack surface
 - The Maxwell community for documenting the L/R balance issue extensively
   enough that "fix this" became a clear goal

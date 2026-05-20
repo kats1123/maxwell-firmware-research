@@ -4,6 +4,16 @@ This is the most important document for anyone trying to understand or fix the
 L/R balance issue. The audio mixer architecture and per-source gain system are
 fully reverse-engineered here.
 
+> **READ FIRST (May 2026):** the section **"Per-source balance: full
+> investigation (May 2026)"** at the bottom of this file is the current,
+> empirically-verified picture — every claim there was tested on real
+> hardware. Where the older sections above it disagree, the May 2026
+> section wins. Key correction: the per-source balance mechanism is real
+> and works, but it is **gated on `NVDM 0xF702`, which nothing ever
+> sets** — so the correction never matches the actual source. The older
+> sections' RE detail (mixer, audio-context struct, EQ system) is still
+> good; only the "how the source state gets set" claims were wrong.
+
 ## TL;DR
 
 The Maxwell maintains a small **audio context struct in SRAM** that stores
@@ -128,9 +138,18 @@ independent gain calibration.
 ### How the source state gets set
 
 `NVDM 0xF702` is **not** auto-detected from hardware. It's set by an explicit
-RACE command (sub-command `0x2F` of command `0x0900`). The Audeze app sets this
-when connection state changes. If something goes wrong and `0xF702` is stale
-or wrong, you can end up loading the wrong balance for your current source.
+RACE command (sub-command `0x2F` of command `0x0900`).
+
+> **CORRECTION (May 2026, empirically verified):** an earlier version of
+> this section said "the Audeze app sets this when connection state
+> changes." **That is wrong — tested and disproven.** The Windows Audeze
+> app does NOT write `0xF702` (verified by opening it, fresh-connecting
+> the headset, and reading `0xF702` — unchanged). Neither does the dongle
+> nor a Bluetooth connection. **Nothing observed ever sets `0xF702`.**
+> See the "Per-source balance: full investigation (May 2026)" section at
+> the bottom of this file for the complete, tested picture. The
+> consequence: the loader always runs against a stale `0xF702`, so the
+> per-source balance correction never actually matches the real source.
 
 ### Audeze's factory defaults
 
@@ -525,3 +544,134 @@ A more thorough sweep is needed to map the full rejected set. The validation
 logic is somewhere in the cmd 0x0900 sub 0x29/0x2A write handler
 (starting at `0x817B132` per the dispatcher analysis); decoding it would
 explain why `0x8E` specifically is blocked.
+
+---
+
+# Per-source balance: full investigation (May 2026)
+
+This section is the complete, empirically-verified picture of the
+Maxwell's per-source L/R balance system — why the headset sounds
+imbalanced and why the built-in correction never applies. Every claim
+here was tested on real hardware.
+
+## Measured imbalance (the actual defect)
+
+With the runtime buffer set to a **symmetric** value (L==R, so no
+balance correction applied), the headset's own output was measured:
+
+| Source | Left | Right | Imbalance |
+|--------|------|-------|-----------|
+| USB-C  | 57.5 | 64.3  | **R louder by 6.8 dB** |
+| Dongle | 53.1 | 55.3  | **R louder by 2.2 dB** |
+| Bluetooth | not measured | | (owner does not use BT) |
+
+Both sources lean the **same direction** (right louder) but by very
+different amounts. So the imbalance has two components:
+- a **consistent** part (right always louder) — a base headset/hardware
+  imbalance, source-independent;
+- a **per-source** part — the USB-C path adds ~4.6 dB more right-bias
+  on top of the dongle.
+
+A single correction value therefore cannot fix both sources. They
+genuinely need different corrections (same direction, different size).
+
+## The correction mechanism (and why it never applies)
+
+The firmware *has* a per-source balance correction system. It works
+like this:
+
+```
+NVDM 0xF665  = USB-C balance   (4 bytes: L, R, slider, dir)
+NVDM 0xF668  = wireless balance (dongle AND bluetooth share this)
+NVDM 0xF702  = "source state"  (0x0A = USB-C, anything else = wireless)
+
+at every restart:
+  main() -> FUN_0x081DE120 -> (tail) loader:
+     read 0xF702
+     if 0xF702 == 0x0A:  load NVDM 0xF665 -> buffer 0x142039AC
+     else:               load NVDM 0xF668 -> buffer 0x142039AC
+     DSP-apply the buffer
+```
+
+Five findings, each empirically proven, explain why this never works
+in practice:
+
+1. **The loader works** — set `0xF702=0`, restart → the buffer loaded
+   `0xF668`'s value; set `0xF702=0x0A`, restart → loaded `0xF665`. The
+   pick logic is functional.
+2. **The loader runs only at a restart** (power down/up re-runs
+   `main()`). A live source switch with the headset staying powered
+   does NOT reload the buffer (proven: a directly-written marker
+   survived a USB-C reconnect).
+3. **The loader keys off `0xF702` ONLY — never the physical source.**
+   Restarting while physically on the dongle, with `0xF702=0x0A`, still
+   loaded the USB-C key `0xF665`.
+4. **Nothing ever sets `0xF702`.** Tested and ruled out: the Windows
+   Audeze app (opened, and fresh-connected), the dongle (connect /
+   round-trip), a Bluetooth connect + audio session. Code-traced:
+   `main()` never writes `0xF702`; the only writer in the whole
+   firmware is the RACE sub-`0x2F` handler (`0x0817B2B2`), which needs
+   a host command. The physical-source detection (transition dispatcher
+   `FUN_0x08154BA8`) runs later, in task context, *after* the loader —
+   and never writes `0xF702`.
+5. **Only 2 slots for 3 sources.** The loader's choice is binary
+   (USB-C vs not-USB-C), so the dongle and Bluetooth are forced to
+   share `0xF668` and cannot be corrected independently.
+
+**Net effect:** `0xF702` holds whatever stale value it was last left
+with; the loader copies one fixed NVDM key into the buffer on every
+restart; the correction is never matched to the actual source. The
+two working halves of the feature — physical-source detection and the
+balance loader — were never wired together.
+
+## Audeze knew: the factory defaults prove it
+
+The stock factory-default values are:
+- `NVDM 0xF665` (USB-C)    = `(141, 149)` — **asymmetric**
+- `NVDM 0xF668` (wireless) = `(147, 147)` — **symmetric**
+
+An asymmetric default is a deliberate correction; you do not ship one
+by accident. Audeze knew the USB-C path has an inherent L/R imbalance
+and baked a correction into its default. The per-source balance system
+is a real, intended feature — it is simply not wired up.
+
+There is **no balance control in the Audeze app**, so this was never a
+user-facing setting — it was meant to be a transparent, automatic
+correction.
+
+## Version history
+
+Firmware `v1.0.1.61`, `.63`, and `.74` are identical in the
+source-state and balance code (same NVDM-key sites, same instruction
+sequences — `tools/compare_versions.py`). Nothing changed across these
+three. Firmwares before `.61` exist but were not available, so an
+earlier change cannot be ruled out.
+
+## Practical notes for testing
+
+- The runtime buffer `0x142039AC` can only be read reliably over
+  **USB-C** (PID 0x4B1E). Over the **dongle** (PID 0x4B18) a RACE
+  `0x1680` RAM read hits the *dongle's own* memory (the dongle is a
+  separate Airoha chip) and always returns `00 00 00 00` — it does not
+  reflect the headset's buffer.
+- Source state is read with `cmd 0x0901 sub 0x2F`, written with
+  `cmd 0x0900 sub 0x2F` (see PROTOCOL.md).
+- A direct RAM write (`cmd 0x1681`) changes only the SRAM buffer and
+  does NOT persist to NVDM — useful to make the buffer differ from
+  NVDM for restart tests.
+
+## The fix (direction)
+
+A real fix must be firmware-side (the headset is used on phones and
+consoles with no host software). The cleanest approach: patch the
+**source-transition handler** — which already knows the source (it
+receives a transition code) — to write `NVDM 0xF702` with the matching
+value. Since switching sources already restarts the headset, the next
+restart's loader then reads the corrected `0xF702` and loads the right
+key. Combined with proper per-source correction values in `0xF665`/
+`0xF668`, this makes the per-source balance actually function.
+
+Open item: confirm the transition-code → source mapping and find a
+code-injection slot for the `0xF702` write. Also unresolved: whether
+DSP register `0x23E0` (written USB-C-only by `FUN_0x081DE120`) is a
+second, independent per-source correction.

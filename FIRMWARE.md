@@ -257,19 +257,41 @@ exactly one `BL` caller, `0x0817B250` inside the cmd 0x0900 handler. It
 is the *slider* handler (writes `0x142039AC[2]/[3]` and persists to
 NVDM). Not the boot loader.
 
-### When the loader runs (terminology)
+### When the loader runs — CORRECTED (May 2026, empirically proven)
 
-The loader is part of `main()`. It runs **only when `main()` re-runs**,
-i.e. on a genuine reboot:
+> An earlier revision of this section claimed a normal power-cycle is a
+> "deep-sleep" where `main()` does not re-run. **That was wrong.** It was
+> based on an ambiguous test (a marker set via a balance write, which
+> also writes NVDM — so "marker survived" couldn't distinguish SRAM
+> retention from a loader reload of the same value).
 
-- **firmware update (FOTA / reflash)** — reboots, `main()` re-runs → loader fires
-- **factory reset** — reboots, `main()` re-runs → loader fires
-- **battery fully drained then recharged** — true cold start → loader fires
+**The loader runs on every restart.** Proven cleanly: write the buffer
+`0x142039AC` via a *direct RAM write* (RACE cmd `0x1681`, which does NOT
+touch NVDM) to a marker value, then power the headset down and up. After
+the restart the buffer holds the **NVDM** value, not the marker — so the
+loader ran and reloaded it. (If `main()` had not re-run, the directly-
+written marker would have survived.)
 
-It does **NOT** run on a normal "power off / power on": that is a deep-sleep,
-SRAM is battery-retained, `main()` does not re-run, so the buffer simply
-keeps whatever it last held. (Avoid the term "cold boot" — on this device a
-normal power-cycle is not a cold boot.)
+Terminology (per the device owner's usage):
+- **restart** = power the headset down, then up. **Re-runs `main()` →
+  loader runs → buffer reloaded from NVDM.**
+- **reset** (factory reset, ~15-20 s in the Audeze app) = the factory-init
+  code writes the firmware-baked default values into NVDM.
+- **flash** = firmware update.
+
+So the buffer's value after any restart is whatever NVDM key the loader
+picked. The buffer only differs from the NVDM key if a RACE balance
+write changed it *since* the last restart. A live source switch with the
+headset staying powered does **not** re-run `main()`, so it does not
+reload the buffer.
+
+### The loader picks the NVDM key from `0xF702` ONLY — not the physical source
+
+Proven empirically (May 2026): with `NVDM 0xF702 = 0x0A` (USB-C),
+restarting the headset **while physically connected via the dongle**
+*still* loaded `NVDM 0xF665` (the USB-C key). The loader's key choice is
+driven solely by the `0xF702` value; it completely ignores which source
+the headset is physically on.
 
 ### Source-state machine (December 2025 — task #6 findings)
 
@@ -424,46 +446,24 @@ The 0x14000000-region SRAM gets ~17.5 KB of .data plus presumably .bss
 zero-init elsewhere. The 0x04000000-region is much larger — 155 KB —
 suggesting that's where the DSP firmware/configuration lives.
 
-### SRAM retention across "power off" (May 2026 empirical test)
-
-The Audeze Maxwell's main SoC SRAM is **battery-backed** — the headset's
-internal battery keeps the SoC powered even when the user "powers off" by
-holding the power button. What the user perceives as a "power cycle" is
-actually a deep-sleep state, not a chip reset.
-
-**Test**: write a unique marker value (e.g. L=119 R=102) to `0x142039AC` via
-RACE, then unplug USB-C, hold power button 5+ seconds, wait 30 seconds, plug
-back in. Read the buffer: **marker is still there, unchanged**. SRAM was
-preserved across the entire "power off" sequence.
-
-**Implication**: a normal "power off / power on" is a deep-sleep — SRAM
-keeps its contents, `main()` does not re-run, the `.data` memcpy does not
-run, and the NVDM loader does not run. The buffer simply keeps its prior
-value. `main()` (and therefore the loader) only re-runs on a genuine
-reboot:
-- Firmware reflash (FOTA)
-- Factory reset (the firmware factory-reset path reboots the chip)
-- Battery fully drained then recharged (could take days)
-
-### Who actually writes the runtime buffer (definitive — empirically verified)
+### Who writes the runtime buffer (definitive — empirically verified May 2026)
 
 | Trigger | Writes `0x142039AC`? |
 |---------|----------------------|
-| Reboot — `.data` init | **Yes** — first writes `0x88 0x88 0x00 0x00` from flash `0x082A6F48` ... |
-| Reboot — NVDM loader (tail of `FUN_0x081DE120`, run by `main()`) | **Yes** — ...then **overwrites** it with `NVDM 0xF665` (USB-C) or `0xF668` (dongle). This is what wins; the buffer ends up holding the NVDM value. |
-| Normal "power off / on" (deep-sleep) | **No** — SRAM retained, `main()` does not re-run, buffer unchanged |
-| Physical source switch (USB ↔ dongle) | **No** — no code path reloads the buffer on a live source switch |
-| RACE source-state change (cmd 0x0900 sub 0x2F) | **No** — only writes NVDM `0xF702` |
-| Firmware factory-reset handler (`FUN_0x081DA030`) | Indirectly — it rewrites NVDM keys and reboots; the post-reboot `main()` loader then loads the fresh NVDM values into the buffer |
-| RACE balance write (cmd 0x0900 sub 0x29/0x2A) | **Yes** — goes through `FUN_0x081DE094`; also persists to NVDM `0xF665`/`0xF668` |
+| Restart (power down/up) — `.data` init | **Yes** — first writes `0x88 0x88 0x00 0x00` from flash `0x082A6F48` ... |
+| Restart — NVDM loader (tail of `FUN_0x081DE120`, run by `main()`) | **Yes** — ...then **overwrites** it with `NVDM 0xF665` (if `0xF702==0x0A`) or `0xF668`. This is what wins; the buffer ends up holding the NVDM-key value. |
+| Live source switch (USB ↔ dongle, headset stays powered) | **No** — `main()` does not re-run; buffer keeps its value. Proven: marker survived a USB-C reconnect. |
+| RACE source-state change (cmd 0x0900 sub 0x2F) | **No** — only writes `NVDM 0xF702` |
+| Firmware factory-reset handler (`FUN_0x081DA030`) | Indirectly — rewrites NVDM keys; the next restart's loader then loads the fresh NVDM values |
+| RACE balance write (cmd 0x0900 sub 0x29/0x2A) | **Yes** — goes through `FUN_0x081DE094`; also persists to `NVDM 0xF665` or `0xF668` (chosen by current `0xF702`) |
+| Direct RAM write (RACE cmd 0x1681) | **Yes** — writes SRAM only, does NOT touch NVDM. Used for clean experiments. |
 
-**Conclusion (corrected)**: at every genuine reboot, the firmware itself
-loads `NVDM 0xF665`/`0xF668` into the runtime buffer — via the tail of
-`FUN_0x081DE120`, which `main()` calls. The custom firmware's patched
-NVDM defaults therefore **do** take effect device-side, with no host
-software involved. (An earlier revision wrongly concluded this was
-host-side only; that conclusion has been retracted — see the CONFIRMED
-loader section above.)
+**Conclusion**: on every restart the firmware loads `NVDM 0xF665`/`0xF668`
+into the runtime buffer via the tail of `FUN_0x081DE120`. The custom
+firmware's patched NVDM defaults therefore do take effect device-side,
+no host software involved — provided the value is actually in NVDM (see
+the NVDM-write-default caveat in PATCHES.md) and `0xF702` selects the
+right key.
 
 ### How `0x142039AC` is actually initialized at boot
 

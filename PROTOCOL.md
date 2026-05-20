@@ -251,6 +251,21 @@ source state — see [AUDIO.md](AUDIO.md).
 06 09 80 05 5A 05 00 00 09 2F 00 0A
 ```
 
+`cmd 0x0900 sub 0x2F` + 1 value byte → writes `NVDM 0xF702`. Use `0x0A`
+for USB-C, `0x00` for dongle/wireless. **Empirically confirmed** (May
+2026): this is the only writer of `0xF702` in the firmware, and nothing
+(Audeze app, dongle, BT) ever sends it automatically.
+
+### Read source state
+
+```
+06 08 80 05 5A 04 00 01 09 2F
+```
+
+`cmd 0x0901 sub 0x2F` → reads `NVDM 0xF702` back. Response:
+`05 5B 06 00 01 09 2F 00 00 <state>` — last byte is the state value.
+Confirmed working May 2026 (`tools` in race-toolkit: `read_source_state.py`).
+
 ### Read right channel gain
 
 ```

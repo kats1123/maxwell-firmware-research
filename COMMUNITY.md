@@ -29,39 +29,35 @@ What we know, what's still unknown, and how to pick up where we left off.
 These are things we encountered but didn't fully resolve. Good starting
 points for further work:
 
-### 0. **(HIGHEST PRIORITY) What triggers the NVDM-to-runtime balance loader?**
+### 0. The NVDM-to-runtime balance loader — RESOLVED (May 2026)
 
-We found TWO loader functions (`FUN_0x081DDFD4` and `FUN_0x081DE2E4`) that
-read `NVDM 0xF665`/`0xF668` based on current source state and write into
-the runtime buffer `0x142039AC`. We've confirmed that:
+The boot loader is found and confirmed. The code at `0x081DE2E4` reads
+`NVDM 0xF665` (USB-C) or `0xF668` (dongle) and writes the result into the
+runtime buffer `0x142039AC`. It is the **tail of `FUN_0x081DE120`** (the
+boot audio-routing init that `main()` calls) — reached by fall-through,
+which is why earlier `BL`-caller scans found nothing.
 
-- Physical source switch (USB-C ↔ dongle) does **NOT** call either loader
-- RACE source-state change (`cmd 0x0900 sub 0x2F` with state=0 or 10)
-  does NOT call either loader
-- RACE balance writes (`cmd 0x0900 sub 0x29/0x2A`) update the buffer
-  directly, NOT via the loader (and ALSO write to NVDM, which is why
-  they're persistent)
-- After factory reset, the buffer ends up with `0xF665` values regardless
-  of physical connection — implying some boot-init path calls one of the
-  loaders with state==10
+It runs **on every genuine reboot** (firmware update, factory reset,
+battery-drain cold start). It does NOT run on a normal "power off / on"
+— that is a deep-sleep, SRAM is battery-retained, `main()` does not
+re-run. And it does NOT run on a live source switch.
 
-**Important real-world implication for the community:** If the loader
-DOES get triggered by some event in normal operation that we haven't
-identified (BT pair/unpair, sleep/wake, factory event), and that trigger
-uses a STALE `NVDM 0xF702` state byte, users could randomly end up with
-the wrong balance loaded — producing seemingly-random "stuck" L/R
-imbalance complaints. This is a plausible explanation for the
-community's "balance suddenly shifted" reports.
+Empirically confirmed: flashed stock v1.0.1.63 with no host software
+running; `0x142039AC` came up holding the NVDM `0xF665` value, not the
+`.data` default. See [FIRMWARE.md](FIRMWARE.md) §NVDM-to-runtime balance
+loader and [AUDIO.md](AUDIO.md) §How the buffer gets loaded.
 
-**Find:**
-- All callers (including indirect/jump-table) of `FUN_0x081DDFD4` and
-  `FUN_0x081DE2E4`
-- The boot-init code path that initially loads `0x142039AC`
-- Any RACE command or event that triggers the loader so we can test if
-  `NVDM 0xF668` (BT/dongle key) ever actually gets used at runtime
-- Whether patched `NVDM 0xF668` value (141/154) is even stored after
-  factory reset (might be skipped because `nvdm_write_default` won't
-  overwrite an existing key)
+**Implication for the community's "balance suddenly shifted" reports:**
+the loader uses the source state from `NVDM 0xF702` to pick which key to
+load. If that state byte is ever stale/wrong at boot, a reboot could load
+the wrong-source balance. Also, since the buffer is battery-retained
+across sleep, a one-off bad RACE write (e.g. from buggy host software)
+sticks until the next true reboot. Both are plausible mechanisms.
+
+**Still open:**
+- Confirm the `0xF668` (dongle) branch by booting dongle-first.
+- Whether patched `NVDM 0xF668` value is stored after factory reset
+  (`nvdm_write_default` won't overwrite an existing key).
 
 ### 0b. Why is `0x8E` (142) specifically rejected by the balance writer?
 

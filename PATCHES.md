@@ -137,80 +137,55 @@ privilege escalation in the active firmware.
    ```
    For patch `0x186C72`: read flash at `0x081A5C72`, confirm bytes match
    your patched values.
-3. If verifying balance patches specifically: after factory reset, the
-   new defaults are written into the NVDM partition. **However, see the
-   important caveat below about whether NVDM values are actually applied
-   to runtime audio.**
+3. If verifying balance patches specifically: after a factory reset or a
+   firmware reflash, the firmware reboots, re-runs `main()`, and the boot
+   loader copies the patched NVDM `0xF665`/`0xF668` default into the
+   runtime buffer `0x142039AC`. You can confirm by reading `0x142039AC`
+   over RACE (cmd `0x1680`) — it should hold your patched L/R.
 
-## NEW (May 2026) — proposed `.data` patch for true firmware-only balance
+## How the balance patches actually work (CONFIRMED May 2026)
 
-**The cleanest firmware-only fix** for L/R balance is to patch the `.data`
-section bytes at file `0x287F48` (which the reset handler memcpys into
-runtime buffer `0x142039AC` at boot):
+The two patches `0x186C72` (NVDM `0xF668`) and `0x186CA4` (NVDM `0xF665`)
+change the **factory-default values** the firmware writes to NVDM during
+a factory reset.
 
-| Field | Current bytes | Patched bytes |
-|-------|---------------|---------------|
-| Stock (file `0x287F48`) | `88 88 00 00` (L=136, R=136, slider=0, dir=0) | `<L> <R> 00 00` (your preferred L/R) |
+The firmware then **loads those NVDM values into the runtime audio buffer
+`0x142039AC` on every reboot** — this was empirically confirmed (flashed
+stock v1.0.1.63 with no host software running; `0x142039AC` came up
+holding the NVDM `0xF665` value, not the `.data` default). The loader is
+the tail of `FUN_0x081DE120`, the boot audio-init function called by
+`main()`. See [FIRMWARE.md](FIRMWARE.md) §NVDM-to-runtime balance loader.
 
-Example for L=141, R=143: change file `0x287F48` from `88 88 00 00` to
-`8D 8F 00 00`.
+So the patch chain is:
 
-This patch:
-- Affects boot init directly — the reset handler's `.data` memcpy copies
-  these bytes from flash to SRAM. No code execution needed.
-- Combined with **SRAM retention** (see [FIRMWARE.md](FIRMWARE.md) §SRAM
-  retention), the value persists across every "power off" until the next
-  true cold reset.
-- Survives factory reset (Audeze HQ's factory reset still works as
-  before via NVDM defaults + host-side RACE writes; AND now the firmware's
-  boot init also produces the same values, so the buffer is correct
-  regardless of host involvement).
-- Requires re-computing the partition-2 SHA-256 and outer SHA-256 (the
-  patch is inside partition 2's decompressed region — file `0x287F48` is
-  past the partition 2 start at `0x114000`).
+```
+patch NVDM 0xF665 default  ─┐
+                            ├─ factory reset → NVDM 0xF665 = patched value
+patch NVDM 0xF668 default  ─┘
+                            └─ every reboot → main() → FUN_0x081DE120 tail
+                                              → 0x142039AC = NVDM value
+                                              → DSP-applied
+```
 
-The existing patches at `0x186C72` and `0x186CA4` (NVDM defaults) are
-still useful — they ensure Audeze HQ's "load defaults" UI shows the right
-values — but they are now understood to be **secondary** to the `.data`
-patch, not primary.
+This is a **fully device-side fix** — no host software, works on iPhone,
+console, anything. The patched balance takes effect after the next
+factory reset (which sets the NVDM value) and is then re-applied to the
+runtime buffer on every reboot.
 
-## CRITICAL CAVEAT — NVDM balance patches may not actually change audio
+### The `.data` patch (`0x287F48`) — optional and redundant
 
-(December 2025 finding via static analysis — see [FIRMWARE.md](FIRMWARE.md)
-§How `0x142039AC` is actually initialized and §Loader-cluster function map.)
+`firmware_patcher.py` can also patch the `.data` bytes at file `0x287F48`
+(the compile-time initial value of `0x142039AC`, stock `88 88 00 00`).
+**This patch is redundant**: the boot loader overwrites `0x142039AC` with
+the NVDM value a few instructions later, so whatever `.data` put there
+does not survive boot. It is harmless (the patcher still includes it by
+default) but it accomplishes nothing the NVDM patches don't already do.
+Use `--no-data-patch` to skip it; it makes no functional difference.
 
-The two balance-default patches above (`0x186C72` and `0x186CA4`) only
-modify what gets WRITTEN to NVDM `0xF665`/`0xF668` during factory init.
-**They do NOT modify the values that get loaded into the runtime audio
-buffer at `0x142039AC` at boot or source switch.**
+### Retraction
 
-Specifically:
-
-- The runtime balance buffer `0x142039AC` is initialized at every cold
-  boot to `0x88 0x88 0x00 0x00` (L=136, R=136, slider=0, dir=0) via a
-  .data-section flash-to-SRAM copy in the reset handler. This value
-  comes from flash address `0x082A6F48` (file offset `0x287F48`), NOT
-  from NVDM.
-- The "NVDM-to-runtime balance loader" function `FUN_0x081DE2E4` exists
-  in firmware but has **zero callers** anywhere — it's dead code.
-- The other loader-cluster function (`FUN_0x081DDFD4`) only fires on a
-  RACE balance write — it's not invoked at boot or on source switch.
-- The balance-writer function `FUN_0x081DE094` has **separately
-  hardcoded** default values for its `0x88` and `0x8E` sentinel inputs
-  (at runtime offsets `0x081DE0F0`, `0x081DE0F8`, `0x081DE104`,
-  `0x081DE108`, `0x081DE114`, `0x081DE118`). These constants are NOT
-  patched by any current patch. They contain stock values like 0x8D/0x95
-  regardless of how we patched NVDM defaults.
-
-**Practical implication**: if you flash patches `0x186C72` and `0x186CA4`
-and observe that runtime audio is affected, the mechanism is not the
-direct NVDM-to-runtime path. It must go through some other code path
-that we have not yet identified, OR the persistent buffer state from a
-previous RACE write is what you're observing.
-
-To make balance patches reliably affect runtime audio at every boot
-without depending on host-side intervention, additional patch sites in
-the loader cluster (around `0x081DE094`) need to be identified — or a
-new patch needs to be designed to make `FUN_0x081DE2E4` (the dead-code
-loader) actually get called during boot. This is the highest-priority
-open research question on this project.
+An earlier revision of this file claimed the NVDM balance patches "may
+not actually change audio" because "`FUN_0x081DE2E4` is dead code." That
+was wrong — `0x081DE2E4` is not a separate function, it is the tail of
+`FUN_0x081DE120` and runs on every reboot. The NVDM patches **do** work
+device-side. That section has been removed.

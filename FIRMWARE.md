@@ -211,29 +211,65 @@ logged through this format string.
 0x4200xxxx     Audio hardware registers (memory-mapped I/O)
 ```
 
-### NVDM-to-runtime balance loader functions — exhaustive caller map
+### NVDM-to-runtime balance loader — CONFIRMED (May 2026, empirically verified)
 
-Two functions in firmware load `0x142039AC` from NVDM based on current
-source state (`NVDM 0xF702`):
+> **CORRECTION**: An earlier revision of this document claimed the
+> NVDM-to-runtime loader (`0x081DE2E4`) was "dead code with zero callers."
+> **That was wrong** — it was a disassembly-boundary mistake. `0x081DE2E4`
+> is *not a separate function*; it is the **tail of `FUN_0x081DE120`**,
+> the boot-time audio-routing init. It has no callers because nothing
+> *calls* it — execution *falls through* into it. It runs at every true
+> reboot. Verified empirically: flashing stock v1.0.1.63 with no host
+> software running left `0x142039AC` holding the NVDM `0xF665` value
+> (`8D 95`), not the `.data`-init value (`88 88`).
 
-| Function | Code addr | Inner NVDM read | Direct BL callers | Indirect (literal-pool) callers |
-|----------|----------|------------------|-------------------|--------------------------------|
-| Loader A (async) | `FUN_0x081DDFD4` | `bl 0x814fed8` | **1** — exactly `0x817B250` (inside cmd 0x0900 handler) | **0** |
-| Loader B (sync)  | `FUN_0x081DE2E4` | `bl 0x814feac` | **0** | **0** |
+**The loader chain:**
 
-**Loader B is dead code.** Zero callers anywhere in the firmware (verified
-by exhaustive scan of BL/BLX instructions and 4-byte-aligned literal-pool
-entries containing the function address with or without the Thumb bit set
-— see `tools/find_loader_callers.py`).
+```
+firmware update / factory reset  (anything that makes main() re-run)
+  └→ reset handler
+      └→ main()  [FUN_0x081D9354]
+          └→ BL FUN_0x081DE120   @ 0x081D9406   ← boot audio-routing init
+              ├─ ~0x1C0 bytes of DSP register setup
+              └─ FALLS THROUGH (no return instruction) into the
+                 loader tail at 0x081DE2E4:
+                   1. FUN_0x0817B2F4 → read current source state (NVDM 0xF702)
+                   2. state == 0xA (USB-C) → nvdm_read(0xF665, 0x142039AC, 4)
+                      else                 → nvdm_read(0xF668, 0x142039AC, 4)
+                   3. clamp 0x142039AC[2] / [3] (slider/dir) to max 6
+                   4. FUN_0x081DDF78 → push the 4 bytes to the DSP
+              └─ return  @ 0x081DE32A  (pop balances the push at 0x081DE120)
+```
 
-**Loader A has exactly one caller**: the cmd 0x0900 balance-write handler.
-It is never invoked from any other code path (no boot init, no source
-switch, no message dispatch, no function pointer table).
+**Proof it is one single function (`0x081DE120`–`0x081DE32A`):**
+- `push.w {r0-r8,sb,sl,lr}` at `0x081DE120`, matching `pop.w {r4-r8,sb,sl,pc}`
+  + `add sp,#0x10` at `0x081DE32A` — registers balance exactly.
+- **Zero** return instructions anywhere between `0x081DE120` and
+  `0x081DE2E4` — execution provably flows straight through.
 
-Both loaders pick `NVDM 0xF665` if state==10 (USB-C), else `0xF668`, and
-write the result into `0x142039AC`. Since Loader B is unreachable, the
-`NVDM 0xF668` (BT/dongle balance) key is effectively **write-only from
-factory init** — nothing in the firmware ever reads it at runtime.
+**Why earlier caller-scans found nothing**: `0x081DE2E4` has no `PUSH`
+prologue and is never the target of a `BL`/`B`/literal-pool reference,
+because it is reached by linear fall-through, not by a call. Caller
+scans by definition cannot see fall-through.
+
+**The other function — `FUN_0x081DDFD4`** (previously "Loader A"): has
+exactly one `BL` caller, `0x0817B250` inside the cmd 0x0900 handler. It
+is the *slider* handler (writes `0x142039AC[2]/[3]` and persists to
+NVDM). Not the boot loader.
+
+### When the loader runs (terminology)
+
+The loader is part of `main()`. It runs **only when `main()` re-runs**,
+i.e. on a genuine reboot:
+
+- **firmware update (FOTA / reflash)** — reboots, `main()` re-runs → loader fires
+- **factory reset** — reboots, `main()` re-runs → loader fires
+- **battery fully drained then recharged** — true cold start → loader fires
+
+It does **NOT** run on a normal "power off / power on": that is a deep-sleep,
+SRAM is battery-retained, `main()` does not re-run, so the buffer simply
+keeps whatever it last held. (Avoid the term "cold boot" — on this device a
+normal power-cycle is not a cold boot.)
 
 ### Source-state machine (December 2025 — task #6 findings)
 
@@ -260,7 +296,7 @@ uint8_t get_source_state(void) {
 | `0x081DDFD8` | Inside slider handler `FUN_0x081DDFD4` (Loader A) |
 | `0x081DE09C` | Inside balance writer `FUN_0x081DE094` |
 | `0x081DE160` | Also inside balance writer (different code path) |
-| `0x081DE2E8` | Inside dead-code Loader B `FUN_0x081DE2E4` |
+| `0x081DE2E8` | Inside the NVDM-load tail of `FUN_0x081DE120` (the boot loader) |
 
 A sister function `FUN_0x0817B334` reads **NVDM `0xF700`** (note: a
 DIFFERENT key). 0xF700 is currently undocumented and only used here —
@@ -353,22 +389,18 @@ it writes include `0x38`/`0x39` (LEFT/RIGHT — the SAME IDs used by the
 DSP-apply function `FUN_0x081DDF78`), with outer-IDs `0x23FF`, `0x203A`,
 `0x23E1`, `0x23E0`, `0x23BA`, `0x2084`, `0x226`, `0x225`.
 
-Crucially: the values written are HARDCODED in the function (`0`, `0x80`,
-`0x81`, `1`, `0x20`), NOT loaded from NVDM `0xF665` or `0xF668`. After
-boot, the DSP runs with these hardcoded gains — until a RACE balance
-write triggers `FUN_0x081DE094` → `FUN_0x081DDF78`, which then pushes
-`0x142039AC`'s value (initially `0x88 0x88`) to the DSP.
+The DSP-register writes here use HARDCODED constants (`0`, `0x80`,
+`0x81`, `1`, `0x20`). **But this function does not end here** — it
+continues (falls through) into the NVDM-load tail at `0x081DE2E4`,
+which reads `NVDM 0xF665`/`0xF668` and writes the result into
+`0x142039AC`, then DSP-applies it. So by the time `FUN_0x081DE120`
+returns, the runtime buffer **has** been populated from NVDM.
 
-**This is the architectural explanation** for why:
-- At boot, the runtime buffer (`0x142039AC` = `0x88 0x88`) and the actual
-  DSP gain values are NOT in sync.
-- Physical source switching has no effect on either the buffer or the
-  DSP gain (no code path reloads either from NVDM).
-- The NVDM `0xF665`/`0xF668` defaults patched by the custom firmware
-  are NEVER read into runtime at boot — they only affect what's
-  persisted to NVDM the next time a RACE write happens (and only
-  if Loader A's NVDM-write path is triggered, which it is via
-  `0x0817B250`).
+See the corrected loader description in
+[§NVDM-to-runtime balance loader — CONFIRMED](#nvdm-to-runtime-balance-loader--confirmed-may-2026-empirically-verified)
+above. The boot sequence does load the NVDM balance defaults into the
+runtime buffer — that is exactly what makes the custom firmware's
+`0xF665`/`0xF668` patches take effect device-side.
 
 ### Boot-time SRAM map (full)
 
@@ -404,34 +436,34 @@ RACE, then unplug USB-C, hold power button 5+ seconds, wait 30 seconds, plug
 back in. Read the buffer: **marker is still there, unchanged**. SRAM was
 preserved across the entire "power off" sequence.
 
-**Implication**: the `.data` section memcpy in the reset handler (which
-would load `0x88 0x88` into `0x142039AC` from flash) only runs on a TRUE
-COLD RESET — which the user almost never triggers in normal use. Possible
-triggers for a true reset:
-- Battery fully drained (could take days)
+**Implication**: a normal "power off / power on" is a deep-sleep — SRAM
+keeps its contents, `main()` does not re-run, the `.data` memcpy does not
+run, and the NVDM loader does not run. The buffer simply keeps its prior
+value. `main()` (and therefore the loader) only re-runs on a genuine
+reboot:
 - Firmware reflash (FOTA)
-- Audeze HQ's "factory reset" action (triggers the firmware factory-reset
-  handler and likely a chip reboot)
+- Factory reset (the firmware factory-reset path reboots the chip)
+- Battery fully drained then recharged (could take days)
 
 ### Who actually writes the runtime buffer (definitive — empirically verified)
 
 | Trigger | Writes `0x142039AC`? |
 |---------|----------------------|
-| Cold boot (.data init) | **Yes** — loads `0x88 0x88 0x00 0x00` from flash `0x082A6F48` |
-| Normal "power off / on" (user-perceived power cycle) | **No** — SRAM retained, buffer unchanged |
-| Physical source switch (USB ↔ dongle) | **No** — no firmware code path consumes this for buffer reload |
-| RACE source-state change (cmd 0x0900 sub 0x2F) | **No** — only writes NVDM `0xF702`, no runtime effect |
-| Firmware factory-reset handler (`FUN_0x081DA030`, triggered by NVDM `0xF082`=`'U'`) | **No** — only rewrites NVDM keys (calls `FUN_0x081A5C70` etc.), no runtime buffer write |
-| Audeze HQ `SetFactoryResetEx` action | **Yes (host-side)** — HQ triggers firmware factory reset AND sends additional RACE balance writes via `FUN_0x081DE094` to load the new NVDM defaults into the buffer |
-| Audeze HQ at startup (idle, no user action) | **No** — empirically verified by opening HQ with marker `33 44` in buffer; buffer unchanged |
-| RACE balance write (cmd 0x0900 sub 0x29/0x2A) | **Yes** — goes through `FUN_0x081DE094` (the only live write path) |
+| Reboot — `.data` init | **Yes** — first writes `0x88 0x88 0x00 0x00` from flash `0x082A6F48` ... |
+| Reboot — NVDM loader (tail of `FUN_0x081DE120`, run by `main()`) | **Yes** — ...then **overwrites** it with `NVDM 0xF665` (USB-C) or `0xF668` (dongle). This is what wins; the buffer ends up holding the NVDM value. |
+| Normal "power off / on" (deep-sleep) | **No** — SRAM retained, `main()` does not re-run, buffer unchanged |
+| Physical source switch (USB ↔ dongle) | **No** — no code path reloads the buffer on a live source switch |
+| RACE source-state change (cmd 0x0900 sub 0x2F) | **No** — only writes NVDM `0xF702` |
+| Firmware factory-reset handler (`FUN_0x081DA030`) | Indirectly — it rewrites NVDM keys and reboots; the post-reboot `main()` loader then loads the fresh NVDM values into the buffer |
+| RACE balance write (cmd 0x0900 sub 0x29/0x2A) | **Yes** — goes through `FUN_0x081DE094`; also persists to NVDM `0xF665`/`0xF668` |
 
-**Conclusion**: the only mechanism that writes to bytes 0/1 of `0x142039AC`
-at runtime is a RACE balance write from a host. Loader B
-(`FUN_0x081DE2E4`) is genuinely dead code — never called from anywhere.
-The custom firmware's NVDM `0xF665`/`0xF668` defaults are functional only
-through Audeze HQ's "factory reset" path, not through any firmware-only
-mechanism.
+**Conclusion (corrected)**: at every genuine reboot, the firmware itself
+loads `NVDM 0xF665`/`0xF668` into the runtime buffer — via the tail of
+`FUN_0x081DE120`, which `main()` calls. The custom firmware's patched
+NVDM defaults therefore **do** take effect device-side, with no host
+software involved. (An earlier revision wrongly concluded this was
+host-side only; that conclusion has been retracted — see the CONFIRMED
+loader section above.)
 
 ### How `0x142039AC` is actually initialized at boot
 
@@ -458,12 +490,22 @@ dst     = 0x142015E8  → 0x142044F4  (SRAM, 12,044 bytes)
 | `0x142039AE` | `0x00` | slider |
 | `0x142039AF` | `0x00` | dir |
 
-**Implications**:
+**Implications (corrected May 2026)**:
 
-1. **At every cold boot, `0x142039AC` initializes to `0x88 0x88 0x00 0x00` (L=136, R=136)** — NOT from any NVDM key.
-2. The NVDM-based runtime balance config (`0xF665` for USB-C, `0xF668` for dongle) is **never loaded at boot**.
-3. The buffer only changes from `0x88 0x88` when something specifically triggers Loader A — and we have proven the ONLY trigger is a RACE balance write (cmd `0x0900` sub `0x29`/`0x2A`).
-4. This explains why after-factory-reset reads of `0x142039AC` matching patched NVDM values must come from a **different code path** that runs during factory reset (not via the .data init). Possibly the factory-reset handler synthesizes an internal RACE balance write to itself, or there is a yet-undiscovered call site for a similar loader function — high-priority next investigation.
+1. The `.data` memcpy writes `0x88 0x88 0x00 0x00` into `0x142039AC` as
+   the *first* step of a reboot — but this is only a transient initial
+   value.
+2. Immediately after, still during `main()`, the NVDM loader (tail of
+   `FUN_0x081DE120`) **overwrites** `0x142039AC` with `NVDM 0xF665`
+   (USB-C) or `0xF668` (dongle). The buffer ends a reboot holding the
+   NVDM value, not `0x88 0x88`.
+3. Empirically confirmed: after flashing stock v1.0.1.63 with no host
+   software running, `0x142039AC` held `8D 95` = the stock `NVDM 0xF665`
+   default — not `88 88`.
+4. So the `88 88` in flash is just the compile-time default of the C
+   variable; it is meaningless at runtime because the loader always
+   replaces it. Patching it (the v3 `.data` patch) is therefore harmless
+   but redundant.
 
 ### `0x142039AC` reference inventory (exhaustive)
 
@@ -476,11 +518,11 @@ else. **No function outside this cluster touches `0x142039AC` directly.**
 
 | Function | Role | Direct BL callers |
 |----------|------|-------------------|
-| `FUN_0x081DDF78` | **DSP-APPLY function** (December 2025 — decoded). Reads all 4 bytes of `0x142039AC` (L, R, slider, dir), then writes them to the DSP via two tail-calls to `FUN_0x081DDF54(reg_id, value, ?)`: first call uses reg_id `0x38` with value `L + slider`, second uses reg_id `0x39` with value `R + dir`. The constant `0x23BA` is passed as the first arg — likely a DSP context/device handle. **This is the bridge between the runtime balance buffer and the actual audio hardware** — until something calls this, changes to `0x142039AC` have no audible effect. Called only from inside the loader cluster (3 internal sites: `0x081DDFEA` inside slider handler, `0x081DE0CC` inside balance writer, `0x081DE318` inside dead-code loader B). | (internal only — no external callers) |
+| `FUN_0x081DDF78` | **DSP-APPLY function** (December 2025 — decoded). Reads all 4 bytes of `0x142039AC` (L, R, slider, dir), then writes them to the DSP via two tail-calls to `FUN_0x081DDF54(reg_id, value, ?)`: first call uses reg_id `0x38` with value `L + slider`, second uses reg_id `0x39` with value `R + dir`. The constant `0x23BA` is passed as the first arg — likely a DSP context/device handle. **This is the bridge between the runtime balance buffer and the actual audio hardware** — until something calls this, changes to `0x142039AC` have no audible effect. Called from 3 internal sites: `0x081DDFEA` inside slider handler, `0x081DE0CC` inside balance writer, `0x081DE318` inside the NVDM-load tail of `FUN_0x081DE120` (the boot loader). | (internal only — no external callers) |
 | `FUN_0x081DDFD4` (= Loader A) | **NVDM-to-runtime async loader.** Reads `NVDM 0xF665` (if state==10) or `0xF668` and copies into `0x142039AC`. The NVDM read uses `bl 0x814fed8` (`nvdm_read`). | **1** — `0x0817B250` (inside cmd 0x0900 handler) |
 | `FUN_0x081DE058` | **NVDM 0xF778 reader.** Reads `NVDM key 0xF778` via `nvdm_read_lock_protect`. The purpose of `0xF778` is currently unknown — see [open question](#unknown-nvdm-keys). | **1** — `0x0817B794` (likely sub `0x31` per PROTOCOL.md) |
 | `FUN_0x081DE094` | **Main balance writer.** Validates input value (`0x88` → special branch, `0x8E` → silent reject), writes byte 0 and/or byte 1 of `0x142039AC` based on a route mask, then writes new state to `NVDM 0xF665` (state==10) or `NVDM 0xF668`. **This is the actual `FUN_001BF04C` from older docs**, but exposed at its real address `0x081DE094`. | **1** — `0x0817B27A` (sub `0x29`/`0x2A`/`0x28` handler) |
-| `FUN_0x081DE2E4` (= Loader B) | **DEAD CODE.** Zero callers anywhere in firmware. Reads `NVDM 0xF665` via `nvdm_read_lock_protect`. Probably an earlier version of Loader A that was superseded but never removed. | **0** |
+| `0x081DE2E4` (NVDM-load tail of `FUN_0x081DE120`) | **THE BOOT LOADER.** NOT a separate function — it is the tail of `FUN_0x081DE120` (boot audio-routing init, called by `main()`). Reads `NVDM 0xF665` (USB-C) or `0xF668` (dongle) via `nvdm_read_lock_protect`, writes the 4 bytes into `0x142039AC`, clamps slider/dir, then DSP-applies via `FUN_0x081DDF78`. Reached by fall-through, so it has 0 *callers* but runs on every reboot. (Earlier wrongly labeled "Loader B / dead code".) | **0** (reached by fall-through, not a call) |
 
 ### Unknown NVDM keys (newly discovered)
 
@@ -548,8 +590,8 @@ defaults persistently.
 
 | NVDM key | Length | Default | File offset of `movw r0,#key` | Purpose |
 |----------|--------|---------|-------------------------------|---------|
-| `0xF665` | 4 | `0x958D` (L=141 R=149) | `0x186CAC` | **USB-C audio source balance** (state=10) — 4 movw refs across firmware. Loaded by Loader A only. |
-| `0xF668` | 4 | `0x9393` (L=147 R=147) | `0x186C7A` | **BT/dongle audio source balance** (state≠10) — 4 movw refs. **Never read at runtime** (Loader B is dead code; Loader A's branch for state≠10 IS reachable but appears never triggered in practice — physical source switch does not invoke loader). Effectively write-only from factory init. |
+| `0xF665` | 4 | `0x958D` (L=141 R=149) | `0x186CAC` | **USB-C audio source balance** (state==10). Read by the boot loader (tail of `FUN_0x081DE120`) into `0x142039AC` on every reboot. |
+| `0xF668` | 4 | `0x9393` (L=147 R=147) | `0x186C7A` | **BT/dongle audio source balance** (state≠10). Read by the boot loader on reboot when the source state is dongle/BT. |
 | `0xF666` | ? | ? | (read only) | Unknown — 2 movw refs, likely paired with 0xF665 (USB-C-related sub-config) |
 | `0xF667` | ? | ? | (read only) | Unknown — 2 movw refs |
 | `0xF669` | ? | ? | (read only) | Unknown — 1 movw ref |
@@ -573,7 +615,7 @@ defaults persistently.
 
 **Total NVDM inventory** (from `tools/find_all_nvdm_reads.py` + `find_all_nvdm_defaults.py`): 164 read sites across **~70 unique keys**. Most are infrequently-accessed audio/BT config. Highlights for balance/audio specifically:
 
-- `0xF665` (USB-C balance): read at exactly 1 BL — `0x081DE2FC` inside dead-code Loader B.
+- `0xF665` (USB-C balance): read at exactly 1 BL — `0x081DE2FC`, inside the boot loader (the NVDM-load tail of `FUN_0x081DE120`, run by `main()` at every reboot).
 - `0xF668` (BT/dongle balance): read shares the same BL (r0 reassigned). Not separately read.
 - `0xF666`, `0xF667`, `0xF66C`: each read once at boot init chain — these ARE live config keys.
 - `0xF66B`, `0xF66D`, `0xF669`, `0xF66A`, `0xF670`: each read once elsewhere (specific subsystems).

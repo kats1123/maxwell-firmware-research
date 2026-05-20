@@ -389,24 +389,36 @@ to `93 8D` (L=147 R=141) via RACE while on USB-C, then switching to
 dongle audio — user heard "L much louder" via dongle, matching the values
 set for USB-C. Confirmed the buffer is shared.
 
-## How the buffer gets loaded
+## How the buffer gets loaded (CONFIRMED May 2026)
 
-Two distinct loader functions in firmware can populate `0x142039AC` from
-the appropriate NVDM key:
+> An earlier version of this section described two "loader functions" and
+> said the boot loader was untraced/dead. **That has been corrected.** The
+> boot loader is found and confirmed — see below.
 
-| Function | NVDM read function used | Behavior |
-|----------|------------------------|----------|
-| `FUN_0x081DDFD4` | `0x814fed8` (async NVDM read) | Reads `0xF665` if state==10 else `0xF668`; async result lands in `0x142039AC` later |
-| `FUN_0x081DE2E4` | `0x814feac` (synchronous NVDM read) | Same key selection logic; synchronous |
+**The boot loader:** the code at `0x081DE2E4` reads `NVDM 0xF665` (USB-C)
+or `0xF668` (dongle) and writes the 4-byte result into `0x142039AC`,
+then DSP-applies it. It is **not a standalone function** — it is the
+*tail* of `FUN_0x081DE120`, the boot audio-routing init that `main()`
+calls. Execution falls straight through into it (no return in between).
+So it runs **at every reboot**:
 
-We searched for every `BL` callsite to both loader functions:
-- `FUN_0x081DDFD4`: only ONE BL caller (`0x817B250`), which is inside
-  the cmd 0x0900 handler (the RACE balance-write code path)
-- `FUN_0x081DE2E4`: TBD (untraced) — but its code references `0x142039AC`
-  via `ldr r4, [pc, #0xf4]` so it's confirmed a writer for this buffer
+```
+reboot → main() [FUN_0x081D9354] → FUN_0x081DE120 → (fall-through)
+       → read NVDM 0xF665/0xF668 → write 0x142039AC → DSP-apply
+```
 
-Source-state-change events (whether physical USB plug or RACE `0x2F`
-sub-cmd) do **NOT** call either loader directly.
+Empirically proven: flashing stock v1.0.1.63 with no host software
+running left `0x142039AC` holding the NVDM `0xF665` value (`8D 95`),
+not the `.data`-init value (`88 88`).
+
+**`FUN_0x081DDFD4`** (formerly mislabeled "Loader A"): the *slider*
+handler, not a loader. One `BL` caller (`0x0817B250`), in the cmd 0x0900
+RACE path. Writes `0x142039AC[2]/[3]` (slider/dir) and persists to NVDM.
+
+**Why a live source switch does nothing:** the loader is part of
+`main()`. A physical USB↔dongle switch or a RACE `0x2F` sub-cmd does not
+re-run `main()`, so the buffer is not reloaded mid-session. It only
+reloads on a genuine reboot (firmware update / factory reset).
 
 ## What we observed across source/state events
 
@@ -473,39 +485,26 @@ and `0xF668`):
   changes" does not cause a per-source reload.** We sent state=0 and
   state=10 via RACE; nothing changed.
 
-### Unknown / still open
+### Resolved (May 2026)
 
-- **What exactly triggers the loader function calls.** They have code
-  callers in firmware that we haven't found via simple BL scans
-  (possibly indirect calls, function pointer tables, or interrupt
-  handlers). Boot-init code path likely calls one of them at startup.
-- **Why the boot-init path always picks `0xF665`.** Perhaps default
-  state is 10 (USB-C) on boot. Perhaps the wrong loader is the only
-  one wired into boot. Untested theory: if the state actually got set
-  to non-10 between boot and loader-call, would `0xF668` get loaded?
-- **Whether `NVDM 0xF668` was actually written during our factory
-  init.** We didn't verify NVDM 0xF668 contents directly. Possible that
-  the patched factory init (which uses `nvdm_write_default` = "write
-  if not exists") didn't actually re-write `0xF668` because it wasn't
-  empty after the reset.
-- **What event was supposed to call the loader on source change.**
-  There is clearly intent in the firmware to use the per-source
-  design (storage is there, two loader functions exist), but the
-  hookup is incomplete or broken.
+- **What triggers the loader** — `main()` calls `FUN_0x081DE120` at
+  every reboot; the loader is that function's tail. No mysterious
+  indirect caller — it runs by fall-through. It is NOT triggered by a
+  live source switch (that doesn't re-run `main()`).
+- **Why the loader picks `0xF665`** — it reads the current source state
+  via `FUN_0x0817B2F4` (NVDM `0xF702`) and picks `0xF665` when state is
+  USB-C (`0xA`), `0xF668` otherwise. On the test unit the boot source
+  state was USB-C so `0xF665` was used.
+- **The buffer IS reloaded from NVDM on reboot** — confirmed
+  empirically. The earlier "dual-NVDM design is broken / hookup
+  incomplete" hypothesis was wrong and is retracted.
 
-## Hypothesis: this design bug may explain community-reported issues
+### Still open
 
-Users in the Maxwell community frequently report:
-- "Balance suddenly shifted to one side"
-- "Audio sounds different after some events" (sleep/wake, pair changes)
-- "Sometimes balance is fine, sometimes it's terrible"
-
-If the loader functions DO occasionally get triggered (by some events we
-haven't identified yet — maybe BT pair/unpair, factory event, specific
-RACE sequences), then a stale or incorrect `NVDM 0xF702` source-state
-value could cause the chip to load the WRONG NVDM key, producing
-seemingly-random balance shifts. Investigating what triggers loader runs
-in normal operation is high-priority RE work.
+- Whether `NVDM 0xF668` (dongle) actually gets exercised — the loader's
+  `0xF668` branch is real, but to load it the boot source state must be
+  non-USB-C. Not yet tested on a dongle-first boot.
+- The `0x8E` write-rejection cause (see validation section below).
 
 ## RACE balance value validation rejection
 

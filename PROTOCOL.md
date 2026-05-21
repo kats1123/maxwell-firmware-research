@@ -371,6 +371,41 @@ for i in range(len(r) - 4):
 kernel32.CloseHandle(h)
 ```
 
+## Dongle relay — what reaches the headset, and HID framing
+
+(Confirmed on hardware, May 2026.) Connected over the wireless dongle
+(PID `0x4B18`/`0x4B19`), not every RACE command reaches the headset:
+
+- **`cmd 0x0900` / `0x0901`** (audio gain write / read) **relay** through
+  the dongle to the headset. `cmd 0x0901 sub 0x29`/`0x2A` read the
+  headset's real L/R balance over the dongle; `cmd 0x0900` writes to it
+  take effect. So balance read/write work over USB-C **and** the dongle.
+- **`cmd 0x1680`** (4-byte memory read) is **answered locally by the
+  dongle** — it reads the dongle's own memory, never the headset's.
+
+**HID output-report framing** — the chip locates the RACE packet at a
+**fixed offset**: the `05 5A` magic must sit at **byte 3** of the report.
+Two report-`0x06` layouts achieve that:
+
+- 0x09xx family (body starts `80 05 5A …`): `06 <len:1 byte> 80 05 5A …`
+- 0x1680 (body starts `05 5A …`): `06 <len:2-byte LE> 05 5A …`
+
+A stray byte that shifts `05 5A` off offset 3 makes the command silently
+misparse. Also: a read issued immediately after a write returns a stale /
+garbage value — drain the pending input reports first, or gate the read
+by a few seconds.
+
+## Reading firmware version over the dongle (Airoha SDK)
+
+Raw RACE can't read the headset's version over the dongle (`0x1680` hits
+the dongle). The Audeze app does it through the SDK: `setTargetDevice(0)`
+selects the agent (the dongle), `setTargetDevice(1)` selects the partner
+(the headset behind it). `requestDFUInfo()` then reports that device's
+version on the `registerUpdateResultCallback` callback — status `0`,
+msgId `0x2713`, extraData = an ASCII `"v1.0.1.NN"` string. Confirmed on
+hardware: toggling target 0/1 reads the dongle and headset versions
+respectively, repeatably in one session.
+
 ## Related work / further reading
 
 - [ERNW White Paper 74](https://static.ernw.de/whitepaper/ERNW_White_Paper_74_1.0.pdf) — Airoha RACE vulnerabilities (CVE-2025-20700/20701/20702)

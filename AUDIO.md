@@ -672,6 +672,105 @@ key. Combined with proper per-source correction values in `0xF665`/
 `0xF668`, this makes the per-source balance actually function.
 
 Open item: confirm the transition-code → source mapping and find a
-code-injection slot for the `0xF702` write. Also unresolved: whether
-DSP register `0x23E0` (written USB-C-only by `FUN_0x081DE120`) is a
-second, independent per-source correction.
+code-injection slot for the `0xF702` write.
+
+## The per-source DSP profile system (May 2026)
+
+NOTE: this mechanism was twice wrongly written up as the "root cause"
+of the L/R imbalance. It is NOT — see "Why this is not the root cause"
+below. This section documents a real firmware structure; it does not
+explain the imbalance.
+
+### What `FUN_0x081DE120` actually does
+
+The boot audio init reads the source state once (`r7 = FUN_0x0817B2F4()`
+= NVDM `0xF702`, `0x0A` = USB-C, anything else / absent = wireless) and
+then drives the audio DSP three ways, **all gated on that one `r7`**:
+
+1. **A per-source coefficient table at `0x082938CE`.** 550 six-byte
+   entries: `[coeff:u16-LE, wireless_L, wireless_R, usbc_L, usbc_R]`.
+   A loop walks the table; for each entry it writes `coeff` to the DSP
+   with the **wireless** pair (offsets -4/-3) when `r7 != 0x0A`, or the
+   **USB-C** pair (offsets -2/-1) when `r7 == 0x0A`. Channel `0x38` =
+   LEFT, `0x39` = RIGHT, via `FUN_0x081DDF54` → `FUN_0x081DDEEC` →
+   `FUN_0x08138D68` (a retried hardware-bus transaction).
+
+2. **A standalone USB-C-only write:** `cmp r7,#0xa` then, only if USB-C,
+   `coeff 0x23E0 = (L=0, R=0x20)`. Wireless never writes `0x23E0`.
+
+3. **The balance loader** (function tail): loads NVDM `0xF665` (USB-C)
+   or `0xF668` (wireless) into `0x142039AC`, then `FUN_0x081DDF78`
+   applies it to **DSP coeff `0x23BA`**: `0x23BA L = buf[0]+buf[2]`,
+   `0x23BA R = buf[1]+buf[3]`. So "balance" = coeff `0x23BA` L/R gain;
+   the 4-byte buffer is `[L_base, R_base, L_trim, R_trim]`.
+
+### The decisive measurement (table, all 550 entries)
+
+| column | asymmetric (L≠R) entries | zeroed (L=R=0) entries |
+|--------|--------------------------|------------------------|
+| wireless | **1** / 550 | 248 / 550 |
+| USB-C    | **101** / 550 | far fewer |
+
+The table is triplet-structured (groups of 3 consecutive coeffs +
+Q-format shift byte) — a multi-band biquad filter bank, i.e. the EQ /
+voicing.
+
+- **Wireless profile**: symmetric (L = R for all but one coeff) and
+  sparse — ~248 coeffs bypassed.
+- **USB-C profile**: heavily **per-channel-distinct** (101 asymmetric
+  coeffs) and denser.
+
+So Audeze *did* engineer a separate, per-channel-corrected filter for
+the USB-C path. The asymmetry IS a deliberate L/R correction baked into
+the USB-C voicing. They knew the inputs differ and built a fix for it.
+
+### Why this is not the root cause
+
+The selector is NVDM `0xF702`. Exhaustive whole-firmware scan (BL
+callers, literal pools, raw data — not just `movw` immediates):
+`0xF702` is touched by **exactly two** instructions — `FUN_0x0817B2F4`
+(the *reader*) and one *writer* inside the RACE `sub 0x2F` host-command
+handler (`0x0817B2B2` → `nvdm_write`). No registered factory default.
+The headset's own runtime never writes it; empirically, neither the
+Windows app, dongle-connect nor BT-connect write it.
+
+So in practice `0xF702` is **effectively constant** (absent → reader
+returns 0) — every unit, every boot, picks the same column. A
+configuration that is identical on every unit cannot explain a defect
+that only *some* users get, *sometimes*, with varying severity. A
+constant cannot produce a variable.
+
+**This mechanism is therefore NOT the root cause of the L/R imbalance.**
+It was promoted to "root cause" twice in earlier drafts (first as
+"applies wireless to everyone", then as "path-dependent / drifts") —
+both were errors of the same kind: declaring a firmware structure the
+cause without checking it can produce the observed *variation*.
+
+### Root cause — still unknown; what the field reports constrain it to
+
+Community reports (per the project owner): *some* people, *sometimes*,
+experience the imbalance; for some a reset (sometimes specifically
+resetting the connected phone) fixes it; for others no reset helps.
+Direction is consistent (one channel quieter — left, on the owner's
+unit).
+
+That shape — intermittent, sometimes cleared by a reset, sometimes
+stuck — rules out **both** a fixed hardware mismatch and a fixed
+firmware config (both are constant). It points to a **stateful value
+that is normally volatile but can be persisted to storage**:
+
+- goes bad at runtime → intermittent;
+- a restart reloads it from storage → "any reset works" when storage
+  is still clean;
+- bad value reaches storage → restart reloads it → "no way to fix it";
+- a host re-pushing a clean value → "reset the phone and it fixes it".
+
+The only subsystem with all of those properties is the **runtime
+balance buffer `0x142039AC`** — volatile SRAM, reloaded from NVDM
+(`0xF665`/`0xF668`) on every restart, writable at runtime, persistable
+back to NVDM. This is a *search direction*, not a conclusion: the next
+real step is to enumerate every runtime writer of `0x142039AC` and of
+`0xF665`/`0xF668` and find what can write them asymmetrically.
+
+**Still genuinely open. Do not write up a root cause until a writer
+that can produce the imbalance is actually identified.**

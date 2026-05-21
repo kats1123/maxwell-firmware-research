@@ -35,7 +35,14 @@ Example for L=141, R=154: `49 F6 8D 23` (`movw r3, #0x9A8D`).
 
 Use `firmware_patcher.py --bt-l N --bt-r N` to set values.
 
-**Requires factory reset** to take effect (otherwise old NVDM persists).
+**Requires a FACTORY RESET to take effect.** A flash updates the firmware
+*code* (this `movw` included) but does NOT write NVDM. The patched default
+reaches NVDM only when the firmware's default-registration runs — which
+happens on a **factory reset**. Confirmed May 2026 by direct test: flashed
+a custom `.74` with balance baked to 143/148; a live-flash read showed the
+custom `movw` present, yet the headset still read the old balance — a
+factory reset then applied 143/148. (A mid-session note claimed the flash
+itself applies it; that was a misread of a messy `.63` sequence — retracted.)
 
 ### `0x186CA4` — USB-C default L/R balance
 
@@ -49,7 +56,7 @@ Example for L=141, R=143: `48 F6 8D 73` (`movw r3, #0x8F8D`).
 
 Use `firmware_patcher.py --usb-l N --usb-r N`.
 
-**Requires factory reset** to take effect.
+**Requires a FACTORY RESET to take effect** — see `0x186C72` above.
 
 ### `0x135C66` — Concurrent playback site 1
 
@@ -58,6 +65,8 @@ Enables USB-C and BT to play simultaneously (without one killing the other).
 
 - **Original**: `02 F0 6F F9` (BL to `0x08156F48`)
 - **Patched**: `00 BF 00 BF` (two NOPs)
+- **Status**: APPLIED in `maxwell_v74_custom_v2.bin` — verified against the
+  binary (May 2026): bytes at `0x135C66` are `00 BF 00 BF`.
 
 ### `0x135CC4` — Concurrent playback site 2
 
@@ -68,6 +77,10 @@ playback, though empirical testing on a real device is pending.
 
 - **Original**: `02 F0 6A F9` (BL to `0x08156F9C`)
 - **Patched**: `00 BF 00 BF` (two NOPs)
+- **Status**: NOT applied in `maxwell_v74_custom_v2.bin` — verified against
+  the binary (May 2026): bytes at `0x135CC4` are still the original
+  `02 F0 6A F9`. Despite this section's title, site 2 was never shipped —
+  treat it as an untested candidate, not a current patch.
 
 ## Candidate patches (untested)
 
@@ -168,9 +181,19 @@ patch NVDM 0xF668 default  ─┘
 ```
 
 This is a **fully device-side fix** — no host software, works on iPhone,
-console, anything. The patched balance takes effect after the next
-factory reset (which sets the NVDM value) and is then re-applied to the
-runtime buffer on every reboot.
+console, anything. **But the patched balance takes effect only after a
+FACTORY RESET**, not on the flash itself. Sequence: flash the custom
+firmware (updates the code), then factory-reset the headset — the reset
+runs the default-registration that writes the patched `0xF665`/`0xF668`
+into NVDM, and the boot loader then copies that into the runtime buffer
+`0x142039AC` on every reboot.
+
+CONFIRMED May 2026 by direct test: flashed a custom `.74` with balance
+baked to 143/148; a live-flash read showed the custom `movw` present, yet
+the headset still read the old balance (147/147) — a factory reset then
+applied 143/148. (A mid-session revision wrongly claimed the flash itself
+applies it, from a misread of a messy `.63` flash sequence — retracted;
+the factory-reset requirement is correct and now empirically confirmed.)
 
 ### The `.data` patch (`0x287F48`) — optional and redundant
 

@@ -777,17 +777,26 @@ that can produce the imbalance is actually identified.**
 
 ## Root cause IDENTIFIED (May 2026 update — supersedes "still open" above)
 
-> **Status:** the section above documents the earlier (correct but
+> **Status:** the section above documents an earlier (correct but
 > incomplete) state of the investigation. The findings below are what
 > the deep RE in May 2026 added on top, and they are now the working
-> theory. They are **positive code-level evidence** of a removed
-> subsystem, not inference — the kind of "hole in the code" finding
-> that resolves the previous "still open" status.
+> theory.
+>
+> **Important correction (added after cross-version diff):** an earlier
+> draft of this section framed the orphan table + stubs as evidence
+> Audeze *removed* the master event router. The cross-version diff
+> against v1.0.1.56 (added May 2026 from the public S3 CDN) **disproves
+> that framing**: v56 contains zero references to F702, F665,
+> F703-F707, E42A, EE23, the dispatch table, OR the `bx lr` stub
+> clusters. The entire system appears for the first time in v61.
+> The correct framing is: the system was *added incomplete in v61*
+> and has shipped inert ever since. The orphaned table and `bx lr`
+> stubs are unfinished placeholders, not deletion artifacts.
 
-### The smoking gun: an orphan event-dispatch table
+### The smoking gun: an orphan event-dispatch table (v61+)
 
-The firmware contains a **22-entry function-pointer dispatch table at
-`0x081C3134`**. Entry 11 is `0x081C9C48`, the dispatcher that contains
+The v61+ firmware contains a **22-entry function-pointer dispatch table
+at `0x081C3134`**. Entry 11 is `0x081C9C48`, the dispatcher that contains
 the state-handler call. The 21 other entries are dispatchers for other
 audio-event categories — each begins with the same shape (`push.w`
 prologue, internal sub-dispatch on `r1`).
@@ -800,9 +809,37 @@ prologue, internal sub-dispatch on `r1`).
 - No fn-pointer table points at it.
 
 So the 22 dispatchers + the state handler at `0x081C96F0` are
-**unreachable orphaned code**. The only way to reach them would have
-been the master event router that loaded this table — and that router
-is gone.
+**unreachable code**. The master event router that would have loaded
+this table was never written — it doesn't exist in v61, v63, or v74.
+
+### v56 → v61 cross-version diff (proves the system was added, not removed)
+
+`movw rX, #<key>` instruction counts for every NVDM key in the
+per-source cluster, across versions (XBOX headset, May 2026):
+
+| Key        | v56 | v61 | v63 | v74 | Notes |
+|------------|-----|-----|-----|-----|-------|
+| `0xF665`   | 0   | 4   | 4   | 4   | USB-C balance default (`141/149`, asymmetric). Introduced in v61. |
+| `0xF668`   | 4   | 4   | 4   | 4   | Wireless/BT balance default. v56: `142/142`. v61+: `147/147`. |
+| `0xF702`   | 0   | 2   | 2   | 2   | Per-source selector. Introduced in v61. |
+| `0xF703`   | 0   | 2   | 2   | 2   | State-handler "last-applied" memo. Introduced in v61. |
+| `0xF704`-`0xF707` | 0   | 2 each | 2 each | 2 each | Per-state config cluster. Introduced in v61. |
+| `0xE42A`   | 0   | 4   | 4   | 4   | Event-bus key. Introduced in v61. |
+| `0xEE23`   | 0   | 2   | 2   | 2   | Event-bus key. Introduced in v61. |
+
+**v56 contains literally none of the per-source switching infrastructure.**
+The orphan table at `0x081C3134` doesn't exist in v56. The `bx lr` stub
+clusters at `0x081567CC` and `0x0820D264` don't exist in v56. The state
+handler at `0x081C96F0` doesn't exist in v56. The F702 reader wrapper at
+`0x0817B2F4` doesn't exist in v56.
+
+v56 has **one** balance default — `F668 = 142/142`, symmetric — registered
+once at factory boot, read/written by the runtime via three RACE-driven
+sites. That's the entire balance system in v56.
+
+The v61 release **adds** all of the above at once. Nothing is removed
+between v56 and v61 (in this code area). The "added incomplete" framing
+is the only one consistent with this diff.
 
 ### Nearby clusters of removed-handler stubs
 
@@ -850,41 +887,46 @@ like this unless something was removed.
 
 ### Updated narrative (now the working theory)
 
-1. Audeze built a per-source audio profile switching system. The
-   state handler (`FUN_0x081C96F0`), the 22-dispatcher table at
-   `0x081C3134`, the per-state NVDM cluster (`0xF703`–`0xF707`), the
-   event-bus keys (`0xE42A`, `0xEE23`), and the runtime DSP
-   coefficient table (550 entries with wireless + USB-C columns) are
-   all real, present, working code.
-2. Audeze removed the master event router that drove the table.
-   The table is now unreachable from any code path. Several
-   state-query helper functions in adjacent regions are replaced by
-   `bx lr` / `movs r0, #N; bx lr` stubs.
-3. With the runtime driver gone, `NVDM 0xF702` is **never written
-   by the firmware**. The only writer is the RACE `0x0900 sub 0x2F`
-   host-command handler (which requires an explicit external command).
-   Verified by exhaustive scan across all four NVDM-write functions
-   (`0x814fed8`, `0x814ff40`, `0x814ff68`, `0x821f804`) and every
-   `movw #0xF702` instruction.
-4. `0xF702` becomes a **frozen factory value**. Whatever was written
+1. **v56 and earlier** ship a single-profile balance system: one NVDM
+   key (`F668`), one symmetric default (`142/142`), no per-source
+   machinery. **The L/R imbalance bug does not exist in v56.**
+2. **v1.0.1.61 introduces the per-source switching system** all at once:
+   - A second balance default `F665 = 141/149` (asymmetric) is added.
+   - A selector `F702` is added (`0x0A` picks F665, else picks F668).
+   - The state handler (`FUN_0x081C96F0`), the per-state cluster
+     `F703`-`F707`, the event-bus keys `E42A`/`EE23`, and the 22-entry
+     dispatch table at `0x081C3134` are all added.
+   - A second column on the per-source DSP coefficient table appears
+     (550 entries with wireless + USB-C pairs).
+3. **The master event router that would drive the table was never
+   written.** The dispatch table has no loaders. The state handler is
+   unreachable from any code path. The `bx lr` stub clusters at
+   `0x081567CC` and `0x0820D264` are placeholder slots that were going
+   to be filled in and never were. The feature ships inert from day
+   one of v61.
+4. With no live driver, `NVDM 0xF702` is **never written by the firmware
+   in normal operation**. The only writer is the RACE `0x0900 sub 0x2F`
+   host-command handler. Verified by exhaustive scan across all four
+   NVDM-write functions (`0x814fed8`, `0x814ff40`, `0x814ff68`,
+   `0x821f804`) and every `movw #0xF702` instruction.
+5. `0xF702` becomes a **frozen factory value**. Whatever was written
    at end-of-line QC is what the headset reads forever — factory reset
    doesn't touch it (the reset routine writes `0xF703`, `0xF667`,
    `0xE42A`, `0xEE23`, but not `0xF702`), and no host application in
    the field writes it.
-5. **Factory provisioning varies across units.** Some units shipped
-   with `0xF702 = 0x0A` (USB-C profile — applies the asymmetric
-   `141/149` balance default and the per-channel-corrected EQ).
-   **These are the units whose owners hear L/R imbalance**, regardless
-   of how they connect. Other units shipped with `0xF702 = 0x00`
-   (wireless profile, `147/147` symmetric) and never notice anything
-   wrong.
-6. **Confirmation from Audeze's own behavior.** v1.0.1.74 rewrote
-   **115 of 118 entries in the wireless DSP coefficient column**, and
-   **zero entries in the USB-C column**. The v74 patch notes mention
-   "Fixed a bug that would cause EQ issues when updating previous
-   versions of firmware." That investment is meaningful only if a real
-   population of users is on the wireless profile — corroborating the
-   factory-provisioning-varies model.
+6. **Factory provisioning varies across units.** Some v61+ units shipped
+   with `0xF702 = 0x0A` (loading the asymmetric `141/149` balance
+   default and the per-channel-corrected EQ). **These are the units
+   whose owners hear L/R imbalance**, regardless of how they connect.
+   Other units shipped with `0xF702 = 0x00` (loading `147/147`
+   symmetric) and never notice anything wrong.
+7. **v1.0.1.63 and v1.0.1.74 carry forward the same orphaned structure.**
+   v74 rewrote **115 of 118 entries in the wireless DSP coefficient
+   column**, and **zero entries in the USB-C column**. The v74 patch
+   notes mention "Fixed a bug that would cause EQ issues when updating
+   previous versions of firmware." That investment is meaningful only
+   if a real population of users is on the wireless profile —
+   corroborating the factory-provisioning-varies model.
 
 ### Why this supersedes the "stateful value corrupted at runtime" theory above
 
@@ -912,33 +954,47 @@ fixed it" reports without contradicting any of the above.
 
 ### Practical fix (now shipping)
 
-The companion tool now ships two complementary fixes:
+The companion tool ships three complementary fixes:
 
 1. **One-shot RACE write** ("Set Audio Source" button on the Balance
    tab). Sends `cmd 0x0900 sub 0x2F` with payload `0x00`, setting
    `0xF702 = 0x00` (wireless profile). The change persists for the
    life of the headset because nothing in the firmware ever rewrites
-   `0xF702`.
+   `0xF702`. No flashing required.
 
-2. **4-byte firmware patch** of the `0xF702` reader wrapper
-   (`FUN_0x0817B2F4`). The reader's first 4 bytes become
-   `00 20 70 47` (`movs r0, #0; bx lr`). After flashing, every caller
-   of the reader (boot DSP init at 4 sites, RACE balance writer, and
-   the dead state handler) sees `0` — wireless profile pinned
-   regardless of NVDM state.
+2. **Custom v61 / v63 / v74 firmware with a 4-byte F702-reader patch.**
+   The reader wrapper at `FUN_0x0817B2F4` has its first 4 bytes
+   overwritten: `07 B5 FF 23` → `00 20 70 47` (`movs r0, #0; bx lr`).
+   After flashing, every caller of the reader (boot DSP init at 4
+   sites, RACE balance writer, and the dead state handler) sees `0` —
+   wireless profile pinned regardless of NVDM state. The patch site is
+   located by 20-byte pattern search and is unique in both Xbox and PS
+   stock images of v61, v63, v74 (verified May 2026). The F700 reader
+   (a sibling function at `+0x40` with an identical prologue) is left
+   untouched. Full integrity check on the patched output — outer
+   SHA-256, per-partition SHA-256 hashes (TLV `0x0014`), LZMA
+   stream-size TLV (`0x0011`), and LZMA decompress — all pass.
 
-The patch site is located by 20-byte pattern search and is unique in
-both Xbox and PS stock v74 images (verified May 2026). The F700
-reader (a sibling function at `+0x40` with an identical prologue) is
-left untouched. Full integrity check on the patched output — outer
-SHA-256, per-partition SHA-256 hashes (TLV `0x0014`), LZMA stream-size
-TLV (`0x0011`), and LZMA decompress — all pass on both variants.
+3. **Custom v56 firmware.** The simplest possible result: revert to the
+   pre-feature baseline. v56 has no F702, no F665, no per-source
+   machinery at all — there's nothing to patch and nothing to get
+   stuck on. The tool just rewrites v56's single F668 default to the
+   user's calibrated balance values. The L/R imbalance bug literally
+   cannot manifest on v56 because the asymmetric F665 default doesn't
+   exist there.
+
+All four custom-firmware bases (v56, v61, v63, v74) are user-selectable
+in the Make Custom Firmware flow. Per-unit balance calibration writes
+to NVDM via RACE (both F665 and F668 when both exist, just F668 on
+v56), so the calibration takes effect regardless of which profile the
+firmware happens to load.
 
 ### What remains genuinely open
 
-- **Why** Audeze removed the master event router. Could be a bug they
-  couldn't fix in time, an unfinished refactor, deliberate de-scoping
-  for QA — the orphan code pattern alone doesn't distinguish.
+- **Why** Audeze added the system unfinished in v61. Could be a bug they
+  couldn't resolve, an unfinished refactor that shipped on a deadline,
+  or a deliberate ship-it-broken-and-fix-later call — the orphan code
+  pattern alone doesn't distinguish.
 - **Exact factory-provisioning logic.** We've established `0xF702` is
   a frozen factory value, but not what determines whether any given
   unit gets `0x00` or `0x0A` from the QC bench. Candidates: per-SKU

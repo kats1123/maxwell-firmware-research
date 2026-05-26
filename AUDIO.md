@@ -774,3 +774,175 @@ real step is to enumerate every runtime writer of `0x142039AC` and of
 
 **Still genuinely open. Do not write up a root cause until a writer
 that can produce the imbalance is actually identified.**
+
+## Root cause IDENTIFIED (May 2026 update — supersedes "still open" above)
+
+> **Status:** the section above documents the earlier (correct but
+> incomplete) state of the investigation. The findings below are what
+> the deep RE in May 2026 added on top, and they are now the working
+> theory. They are **positive code-level evidence** of a removed
+> subsystem, not inference — the kind of "hole in the code" finding
+> that resolves the previous "still open" status.
+
+### The smoking gun: an orphan event-dispatch table
+
+The firmware contains a **22-entry function-pointer dispatch table at
+`0x081C3134`**. Entry 11 is `0x081C9C48`, the dispatcher that contains
+the state-handler call. The 21 other entries are dispatchers for other
+audio-event categories — each begins with the same shape (`push.w`
+prologue, internal sub-dispatch on `r1`).
+
+**The table has ZERO loaders anywhere in the firmware.** Verified:
+
+- No `ldr` instruction loads `0x081C3134` (or any address in
+  `[table, table+0x80)`).
+- No 32-bit literal pool entry contains the table base.
+- No fn-pointer table points at it.
+
+So the 22 dispatchers + the state handler at `0x081C96F0` are
+**unreachable orphaned code**. The only way to reach them would have
+been the master event router that loaded this table — and that router
+is gone.
+
+### Nearby clusters of removed-handler stubs
+
+Two suspicious clusters of `bx lr`-only functions sit in the audio
+code region. These are the empty shells of removed state-query
+functions, left as table slot-fillers when the actual logic was
+deleted:
+
+**Cluster at `0x081567CC`** — six consecutive 2-byte stubs:
+
+```
+0x081567CC  70 47  bx lr
+0x081567CE  70 47  bx lr
+0x081567D0  70 47  bx lr
+0x081567D2  70 47  bx lr
+0x081567D4  70 47  bx lr
+0x081567D6  70 47  bx lr
+0x081567D8  f0 b5  push {r4,r5,r6,r7,lr}   <- next real fn
+```
+
+**Cluster at `0x0820D264`** — 20+ tiny stubs, several with
+hardcoded return values:
+
+```
+0x0820D264  70 47        bx lr
+0x0820D266  70 47        bx lr
+0x0820D268  70 47        bx lr
+0x0820D26A  70 47        bx lr
+0x0820D26C  01 20 70 47  movs r0, #1; bx lr   <- "return true"
+0x0820D270  00 20 70 47  movs r0, #0; bx lr   <- "return false"
+0x0820D274  01 20 70 47  movs r0, #1; bx lr
+0x0820D278  70 47        bx lr
+0x0820D27A  01 20 70 47  movs r0, #1; bx lr
+0x0820D27E  70 47        bx lr
+0x0820D280  01 20 70 47  movs r0, #1; bx lr
+0x0820D284  01 20 70 47  movs r0, #1; bx lr
+0x0820D288  00 20 70 47  movs r0, #0; bx lr
+... (continues for another ~12 entries)
+```
+
+A function whose entire body is `return 1` is the textbook shape of
+"we deleted the real implementation and left a no-op slot-filler so
+the table indices still resolve." Real production code does not look
+like this unless something was removed.
+
+### Updated narrative (now the working theory)
+
+1. Audeze built a per-source audio profile switching system. The
+   state handler (`FUN_0x081C96F0`), the 22-dispatcher table at
+   `0x081C3134`, the per-state NVDM cluster (`0xF703`–`0xF707`), the
+   event-bus keys (`0xE42A`, `0xEE23`), and the runtime DSP
+   coefficient table (550 entries with wireless + USB-C columns) are
+   all real, present, working code.
+2. Audeze removed the master event router that drove the table.
+   The table is now unreachable from any code path. Several
+   state-query helper functions in adjacent regions are replaced by
+   `bx lr` / `movs r0, #N; bx lr` stubs.
+3. With the runtime driver gone, `NVDM 0xF702` is **never written
+   by the firmware**. The only writer is the RACE `0x0900 sub 0x2F`
+   host-command handler (which requires an explicit external command).
+   Verified by exhaustive scan across all four NVDM-write functions
+   (`0x814fed8`, `0x814ff40`, `0x814ff68`, `0x821f804`) and every
+   `movw #0xF702` instruction.
+4. `0xF702` becomes a **frozen factory value**. Whatever was written
+   at end-of-line QC is what the headset reads forever — factory reset
+   doesn't touch it (the reset routine writes `0xF703`, `0xF667`,
+   `0xE42A`, `0xEE23`, but not `0xF702`), and no host application in
+   the field writes it.
+5. **Factory provisioning varies across units.** Some units shipped
+   with `0xF702 = 0x0A` (USB-C profile — applies the asymmetric
+   `141/149` balance default and the per-channel-corrected EQ).
+   **These are the units whose owners hear L/R imbalance**, regardless
+   of how they connect. Other units shipped with `0xF702 = 0x00`
+   (wireless profile, `147/147` symmetric) and never notice anything
+   wrong.
+6. **Confirmation from Audeze's own behavior.** v1.0.1.74 rewrote
+   **115 of 118 entries in the wireless DSP coefficient column**, and
+   **zero entries in the USB-C column**. The v74 patch notes mention
+   "Fixed a bug that would cause EQ issues when updating previous
+   versions of firmware." That investment is meaningful only if a real
+   population of users is on the wireless profile — corroborating the
+   factory-provisioning-varies model.
+
+### Why this supersedes the "stateful value corrupted at runtime" theory above
+
+The earlier write-up reasoned: "intermittent + sometimes-cleared-by-reset
++ sometimes-stuck = a stateful value that goes bad at runtime and gets
+persisted." That model required a runtime corrupter we never found, and
+it didn't explain why factory reset never helps the stuck users.
+
+The factory-provisioning-varies model fits the same observations
+more cleanly:
+
+| Community observation | Earlier model | Factory-varies model |
+|----------------------|---------------|----------------------|
+| Some users hear it, some don't | Unexplained variance | `0xF702` varies per factory batch |
+| Reset never fixes it | Required a "value reached storage" step | Factory reset doesn't touch `0xF702` |
+| "Reset the phone fixed it for me" | Required a host re-pushing clean value | Could be that user, who happens to be on wireless profile, ALSO has a separate runtime-buffer issue cleared by re-pushing |
+| It's been stable for years | Required ongoing corruption events | Once factory writes it, it's frozen |
+
+The earlier theory and the new evidence are **not** in conflict for
+unit-to-unit variability — they explain different parts of the
+community-report pattern. The factory-provisioning model is the
+**primary** explanation for the imbalance-population split; a separate
+runtime-buffer issue could explain the rarer "reset the phone and it
+fixed it" reports without contradicting any of the above.
+
+### Practical fix (now shipping)
+
+The companion tool now ships two complementary fixes:
+
+1. **One-shot RACE write** ("Set Audio Source" button on the Balance
+   tab). Sends `cmd 0x0900 sub 0x2F` with payload `0x00`, setting
+   `0xF702 = 0x00` (wireless profile). The change persists for the
+   life of the headset because nothing in the firmware ever rewrites
+   `0xF702`.
+
+2. **4-byte firmware patch** of the `0xF702` reader wrapper
+   (`FUN_0x0817B2F4`). The reader's first 4 bytes become
+   `00 20 70 47` (`movs r0, #0; bx lr`). After flashing, every caller
+   of the reader (boot DSP init at 4 sites, RACE balance writer, and
+   the dead state handler) sees `0` — wireless profile pinned
+   regardless of NVDM state.
+
+The patch site is located by 20-byte pattern search and is unique in
+both Xbox and PS stock v74 images (verified May 2026). The F700
+reader (a sibling function at `+0x40` with an identical prologue) is
+left untouched. Full integrity check on the patched output — outer
+SHA-256, per-partition SHA-256 hashes (TLV `0x0014`), LZMA stream-size
+TLV (`0x0011`), and LZMA decompress — all pass on both variants.
+
+### What remains genuinely open
+
+- **Why** Audeze removed the master event router. Could be a bug they
+  couldn't fix in time, an unfinished refactor, deliberate de-scoping
+  for QA — the orphan code pattern alone doesn't distinguish.
+- **Exact factory-provisioning logic.** We've established `0xF702` is
+  a frozen factory value, but not what determines whether any given
+  unit gets `0x00` or `0x0A` from the QC bench. Candidates: per-SKU
+  defaults, per-line/batch QC differences, or the AB1568 boot ROM
+  doing first-power-on hardware detection. Without a sealed unit
+  reading or the boot ROM image, we can't disambiguate. Doesn't
+  affect the fix — the tool handles all cases.

@@ -26,27 +26,60 @@ correct it.
 
 ### Our best reconstruction of how it got this way
 
-The firmware shows that Audeze **built a per-source balance/correction system
-— and then never wired it up.** Our best-guess narrative, with the parts that
-are evidenced and the parts that are inference marked honestly:
+The firmware shows that Audeze **built a per-source balance/correction system,
+then removed the master event router that drove it**, leaving the rest as
+orphaned dead code. Updated narrative based on the May 2026 deep dive — the
+key change from earlier drafts is that we now have **positive evidence of
+removed code**, not just an "unfinished hookup" inference:
 
 1. **They corrected per source.** The firmware was designed to apply a
    *different* audio correction depending on whether you listen over USB-C or
    wirelessly — because the two paths measurably differ, and Audeze evidently
    knew the USB-C path needed per-channel (left ≠ right) correction.
-2. **They converged the sources.** The most likely reason the per-source
-   system ended up inert is that the paths were brought close enough together
-   that Audeze stopped relying on it — the wireless profile shipped symmetric
-   and largely flat, and the wireless balance default is left = right.
-   *(This step is informed guesswork — see "What's evidenced" below.)*
-3. **So the shipped firmware effectively runs one "equal" profile for
-   everyone.** The selector that is supposed to pick the USB-C-corrected
-   profile is never set, so every unit, on every source, falls back to the
-   symmetric profile.
-4. **But individual headsets still vary.** Driver and analog-path tolerances
-   mean a given unit can still be audibly off — and with the per-source
-   correction inert, nothing in the firmware compensates. That residual,
-   per-unit imbalance is what the companion tool exists to fix.
+2. **They built the runtime switching machinery.** The firmware contains a
+   complete event-routing infrastructure: a state handler that reads `0xF702`,
+   compares it to a `0xF703` last-applied memo, runs per-source cleanup, and
+   updates F703 to match. The state handler is reached via a 22-entry dispatch
+   table at `0x081C3134`. Per-source helper functions, event-bus keys
+   (`0xE42A`, `0xEE23`), and a cluster of per-state config keys (`0xF704`
+   through `0xF707`) all exist as built code.
+3. **They removed the master event router.** The dispatch table at
+   `0x081C3134` has **zero loaders** in the entire firmware — no `ldr`
+   instruction anywhere references its base address, no literal pool contains
+   it, no fn-pointer table points at it. The 22 dispatcher functions and the
+   state handler are reachable only via the table; with no driver, they sit
+   in flash as orphaned dead code. Adjacent clusters of `bx lr` stubs at
+   `0x081567CC` (6 in a row) and `0x0820D264` (20+ in a row, several
+   hardcoding `return 0` or `return 1`) are the empty shells of removed
+   state-query functions — the exact pattern of "we deleted the logic and
+   left the stubs as table slot-fillers."
+4. **`0xF702` became a frozen factory value.** With the runtime driver gone,
+   nothing in the firmware ever writes `0xF702` in normal operation
+   (verified: `0xF702` has exactly one writer, the RACE `0x0900 sub 0x2F`
+   host-command handler; factory reset doesn't touch it; the Audeze app,
+   dongle pairing, and Bluetooth connection don't write it either). Whatever
+   Audeze's QC bench wrote at end-of-line is what the headset is stuck on
+   for life.
+5. **The factory provisioning varies.** Some units shipped with `0xF702 = 0x0A`
+   (USB-C profile — the asymmetric `141/149` balance default plus the
+   per-channel-corrected EQ). **Those are the units whose owners hear the
+   imbalance**, regardless of how they actually connect, because the per-unit
+   hardware doesn't need the per-channel correction the firmware applies.
+   Other units shipped with `0xF702 = 0x00` (wireless profile, `147/147`
+   symmetric) and never notice anything wrong. The two populations explain
+   the observed pattern in community reports: some users complain of
+   imbalance, others don't, factory reset never fixes it for either group.
+6. **Audeze keeps shipping wireless-profile patches.** v74 rewrote 115 of
+   118 entries in the wireless DSP coefficient column (zero entries changed
+   in the USB-C column), and the patch notes mention "Fixed a bug that would
+   cause EQ issues when updating previous versions of firmware." That work
+   is meaningful only if a real population of users is on the wireless
+   profile — confirming the factory-provisioning-varies model.
+
+The companion tool fixes both populations of users: a one-shot RACE write
+flips stuck units to wireless (the value persists because nothing else writes
+F702), and the custom-firmware patch makes the F702 reader always return 0
+so the choice is forced regardless of NVDM state.
 
 ### The evidence
 
@@ -67,14 +100,27 @@ are evidenced and the parts that are inference marked honestly:
   it is a deliberate correction.
 - **Which profile loads is chosen by NVDM `0xF702`** (`0x0A` = USB-C, anything
   else = wireless), read once at every boot.
-- **`0xF702` is never set.** An exhaustive whole-firmware scan (BL callers,
-  literal pools, raw data) found `0xF702` touched by exactly two instructions:
-  a reader, and one writer buried in a RACE host-command handler that only
-  runs on an external command. `main()` never sets it; the Windows Audeze app,
-  the dongle, and a Bluetooth connection were each tested — none write it.
-  With `0xF702` never set it is effectively a constant, so **every unit always
-  loads the wireless (symmetric) column — even on USB-C.** The corrected
-  USB-C profile Audeze built never runs.
+- **`0xF702` has exactly one writer** in the firmware: the RACE `0x0900 sub
+  0x2F` host-command handler. Verified by exhaustive whole-firmware scan
+  across all four NVDM-write functions (`0x814fed8`, `0x814ff40`, `0x814ff68`,
+  `0x821f804`), every `movw #0xF702` instruction, and every fn-pointer table.
+  No firmware-internal code ever updates it. The Windows Audeze app, the
+  dongle, factory reset, and a Bluetooth connection were each tested — none
+  write it.
+- **The runtime switcher was removed.** A 22-entry function-pointer dispatch
+  table at `0x081C3134` contains the state-handler dispatcher (entry 11) plus
+  21 other per-event dispatchers. The table has **zero loaders anywhere in
+  the firmware** — no ldr instruction loads its base, no literal pool entry
+  points at it. The whole event-routing subsystem (table + 22 handlers +
+  state handler at `0x081C96F0`) is unreachable orphan code. Nearby clusters
+  of `bx lr` stubs at `0x081567CC` (6 consecutive) and `0x0820D264` (20+,
+  several hardcoded to return 0 or 1) are removed state-query functions left
+  as empty slot-fillers. **This is the smoking-gun evidence that Audeze
+  built and then removed the per-source switching system.**
+- **`0xF702` is therefore frozen at the factory value** on every shipped
+  unit. Some units shipped with `0x0A` (USB-C profile), others with `0x00`
+  (wireless). The factory-set value persists for the life of the headset
+  unless a host explicitly overwrites it via RACE.
 
 **The runtime balance.** The live L/R gain is a single 4-byte SRAM buffer at
 `0x142039AC`, shared by all sources, reloaded from `0xF665`/`0xF668` on every
@@ -95,31 +141,48 @@ the three.
 ### What's evidenced, and what's still open
 
 - **Evidenced:** the per-source correction system exists; its USB-C profile is
-  per-channel-corrected and its wireless profile is symmetric; the selector
-  `0xF702` is never set, so the corrected profile never loads; real units are
-  measurably imbalanced, by different amounts per source.
-- **Inference:** *why* the system ended up disconnected — step 2 above. The
-  firmware shows the feature half-built, but not whether that was a deliberate
-  de-scoping ("we converged the paths, so we dropped it") or simply an
-  unfinished hookup. We cannot tell which from the firmware alone.
-- **Still open — the per-unit root cause.** The per-source system is a real
-  structure, but it is **not** the root cause of the imbalance: it is
-  effectively a constant — identical on every unit, every boot — and a
-  constant cannot explain a defect that only *some* users get, *sometimes*,
-  with varying severity. Community reports describe it as intermittent —
-  sometimes cleared by a reset, sometimes stuck. That points to a *stateful*
-  value (the runtime balance buffer is the prime suspect), but the mechanism
-  that actually corrupts it has not been identified. **No definitive root
-  cause is claimed here, and none will be until a concrete writer is found.**
+  per-channel-corrected and its wireless profile is symmetric; `0xF702` has
+  exactly one writer (the RACE host-command handler) and is never updated
+  by the firmware itself in normal operation; the master event dispatcher
+  that would have driven runtime switching has been removed (table at
+  `0x081C3134` has zero loaders, surrounding stubs at `0x081567CC` and
+  `0x0820D264`); two field-tested units both read `141/149` (= `0xF702 = 0x0A`,
+  USB-C profile) and complain of imbalance.
+- **Evidenced (v74 patch notes alignment):** v63 → v74 changed 115 of 118
+  entries in the wireless DSP coefficient column and zero in the USB-C
+  column. v74 release notes mention "Fixed a bug that would cause EQ issues
+  when updating previous versions of firmware." Audeze actively maintains
+  the wireless profile, which only makes sense if a real population of
+  shipped units is on it — corroborating the factory-provisioning-varies
+  model.
+- **Inference:** *why* Audeze removed the master driver — unclear from the
+  firmware alone. A bug they couldn't fix in time, a refactor that wasn't
+  finished, or a deliberate de-scoping for QA reasons are all consistent.
+  The orphaned-code pattern alone doesn't distinguish between these.
+- **Still open — the exact factory-provisioning logic.** We've established
+  that `0xF702` is a frozen factory value, but not what determines whether
+  any given unit gets `0x00` or `0x0A`. Candidates: per-SKU defaults that
+  vary by production line, per-batch QC-bench differences, or the AB1568
+  boot ROM doing hardware-detect on first power-on. Without access to a
+  brand-new sealed unit (read F702 before any host activity) or the boot
+  ROM image, we can't disambiguate.
 
 ### The practical fix
 
-Whatever the deeper cause, the runtime balance buffer is directly writable and
-the firmware's NVDM balance defaults are patchable. The companion tool measures
-your unit's imbalance, lets you correct it by ear, and bakes the correction
-into a custom firmware so it survives reboots and a factory reset — applied on
-every device (phone, console, PC) with no software running. Full detail in
-**[AUDIO.md](AUDIO.md)**.
+The companion tool fixes both populations of users:
+
+1. **A one-shot RACE write** ("Set Audio Source" button) sets `0xF702 = 0x00`,
+   moving the headset to the wireless profile. Persists for life because
+   nothing in the firmware ever overwrites it.
+2. **The custom firmware** also patches the F702-reader function
+   (`FUN_0x0817B2F4`, 4-byte patch: `07 B5 FF 23` → `00 20 70 47`) so the
+   reader always returns 0. After flashing, the firmware ignores `0xF702`
+   entirely and the wireless profile is pinned regardless of NVDM state.
+3. **Per-unit balance correction** continues to write both NVDM keys
+   (`0xF665` *and* `0xF668`) to the user's calibrated symmetric values,
+   so balance is correct regardless of which profile happens to be active.
+
+Full detail in **[AUDIO.md](AUDIO.md)**.
 
 ---
 

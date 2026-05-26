@@ -4,15 +4,27 @@ This is the most important document for anyone trying to understand or fix the
 L/R balance issue. The audio mixer architecture and per-source gain system are
 fully reverse-engineered here.
 
-> **READ FIRST (May 2026):** the section **"Per-source balance: full
-> investigation (May 2026)"** at the bottom of this file is the current,
-> empirically-verified picture — every claim there was tested on real
-> hardware. Where the older sections above it disagree, the May 2026
-> section wins. Key correction: the per-source balance mechanism is real
-> and works, but it is **gated on `NVDM 0xF702`, which nothing ever
-> sets** — so the correction never matches the actual source. The older
-> sections' RE detail (mixer, audio-context struct, EQ system) is still
-> good; only the "how the source state gets set" claims were wrong.
+> **READ FIRST (current, May 2026):** the per-source balance mechanism
+> is real. `NVDM 0xF702` selects which balance default loads at boot
+> (`0x0A` → asymmetric USB-C `141/149`; anything else → symmetric
+> wireless `147/147`). The single in-firmware writer of `0xF702` is the
+> RACE `0x0900 sub 0x2F` host-command handler at `0x0817B0E4`. That
+> path is reachable from incoming RACE frames — registered via the
+> dispatch table at `0x0828A8E0` whose handler `0x0817B92C` tail-calls
+> the SET dispatcher with `B.W`, not `BL.W` (which is why static
+> "BL-only" searches missed it earlier). Writes via this path persist
+> in NVDM across full power cycles — verified empirically. **What no
+> firmware code does is issue that write on its own**: not on USB-C
+> plug-in, not on Bluetooth connect, not on factory reset, not from
+> the dongle. An exhaustive search (~50h, both headset and dongle,
+> all four firmware versions, every NVDM-write call site, every
+> dispatch table, every event-bus key) turned up no auto-trigger. We
+> can't rule one out; we can only report that we couldn't find one.
+> The practical consequence is that `0xF702` is whatever the factory
+> left it, for life, on each unit. The older sections below are still
+> correct on RE mechanics (mixer, audio-context struct, EQ system);
+> only the earlier "shipped inert / dispatch chain has no callers"
+> framing was wrong — corrected here.
 
 ## TL;DR
 
